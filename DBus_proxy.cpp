@@ -70,16 +70,16 @@ static void log_info(const char *format, ...)
 }
 
 // Forward method calls from target bus to source bus
-static void handle_method_call(GDBusConnection *connection,
+static void handle_method_call(GDBusConnection *connection G_GNUC_UNUSED,
                                const char *sender,
                                const char *object_path,
                                const char *interface_name,
                                const char *method_name,
                                GVariant *parameters,
                                GDBusMethodInvocation *invocation,
-                               gpointer user_data)
+                               gpointer user_data G_GNUC_UNUSED)
 {
-    log_verbose("Method call: %s.%s from %s", interface_name, method_name, sender);
+    log_verbose("Method call: %s.%s from %s object_path=%s", interface_name, method_name, sender, object_path);
     
     // Forward the call to the source bus
     g_dbus_connection_call(
@@ -111,13 +111,13 @@ static void handle_method_call(GDBusConnection *connection,
 }
 
 // Handle property get requests
-static GVariant *handle_get_property(GDBusConnection *connection,
+static GVariant *handle_get_property(GDBusConnection *connection G_GNUC_UNUSED,
                                      const char *sender,
-                                     const char *object_path,
+                                     const char *object_path G_GNUC_UNUSED,
                                      const char *interface_name,
                                      const char *property_name,
                                      GError **error,
-                                     gpointer user_data)
+                                     gpointer user_data G_GNUC_UNUSED)
 {
     log_verbose("Property get: %s.%s from %s", interface_name, property_name, sender);
     
@@ -148,14 +148,14 @@ static GVariant *handle_get_property(GDBusConnection *connection,
 }
 
 // Handle property set requests
-static gboolean handle_set_property(GDBusConnection *connection,
+static gboolean handle_set_property(GDBusConnection *connection G_GNUC_UNUSED,
                                     const char *sender,
-                                    const char *object_path,
+                                    const char *object_path G_GNUC_UNUSED,
                                     const char *interface_name,
                                     const char *property_name,
                                     GVariant *value,
                                     GError **error,
-                                    gpointer user_data)
+                                    gpointer user_data G_GNUC_UNUSED)
 {
     log_verbose("Property set: %s.%s from %s", interface_name, property_name, sender);
     
@@ -184,13 +184,13 @@ static gboolean handle_set_property(GDBusConnection *connection,
 }
 
 // Forward signals from source bus to target bus
-static void on_signal_received(GDBusConnection *connection,
+static void on_signal_received(GDBusConnection *connection G_GNUC_UNUSED,
                                const char *sender_name,
-                               const char *object_path,
+                               const char *object_path G_GNUC_UNUSED,
                                const char *interface_name,
                                const char *signal_name,
                                GVariant *parameters,
-                               gpointer user_data)
+                               gpointer user_data G_GNUC_UNUSED)
 {
     log_verbose("Signal received: %s.%s from %s", interface_name, signal_name, sender_name);
     
@@ -326,7 +326,8 @@ static gboolean setup_proxy_interfaces()
     GDBusInterfaceVTable vtable = {
         .method_call = handle_method_call,
         .get_property = handle_get_property,
-        .set_property = handle_set_property
+        .set_property = handle_set_property,
+        .padding = {0} // Initialize padding array
     };
     
     // Register each interface on the target bus
@@ -494,29 +495,46 @@ static void print_usage(const char *program_name)
     g_print("Usage: %s [OPTIONS]\n", program_name);
     g_print("Cross-bus D-Bus proxy that forwards method calls and signals between buses.\n\n");
     g_print("Options:\n");
-    g_print("  --source-bus-name NAME     Source service bus name (default: org.freedesktop.NetworkManager)\n");
-    g_print("  --source-object-path PATH  Source object path (default: /org/freedesktop/NetworkManager)\n");
-    g_print("  --proxy-bus-name NAME      Proxy bus name (default: org.example.Proxy)\n");
+    g_print("  --source-bus-name NAME     Source service bus name (example: org.freedesktop.NetworkManager)\n");
+    g_print("  --source-object-path PATH  Source object path (example: /org/freedesktop/NetworkManager)\n");
+    g_print("  --proxy-bus-name NAME      Proxy bus name (example: org.example.Proxy)\n");
     g_print("  --source-bus-type TYPE     Source bus type: system|session (default: system)\n");
     g_print("  --target-bus-type TYPE     Target bus type: system|session (default: session)\n");
     g_print("  --verbose                  Enable verbose logging\n");
     g_print("  --help                     Show this help message\n");
 }
 
+// Validate required proxy configuration parameters
+void validateProxyConfigOrExit(const ProxyConfig& config) 
+{
+    if (!config.source_bus_name || !strlen(config.source_bus_name)) {
+        log_error("Error: source_bus_name is required!\n");
+        exit(EXIT_FAILURE);
+    }    
+    if (!config.source_object_path || !strlen(config.source_object_path)) {
+        log_error("Error: source_object_path is required!\n");
+        exit(EXIT_FAILURE);
+    }
+    if (!config.proxy_bus_name || !strlen(config.proxy_bus_name)) {
+        log_error("Error: proxy_bus_name is required!\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     // Default configuration
     ProxyConfig config = {
-        .source_bus_name = "org.freedesktop.NetworkManager",
-        .source_object_path = "/org/freedesktop/NetworkManager", 
-        .proxy_bus_name = "org.example.Proxy",
+        .source_bus_name = "",
+        .source_object_path = "", 
+        .proxy_bus_name = "",
         .source_bus_type = G_BUS_TYPE_SYSTEM,
         .target_bus_type = G_BUS_TYPE_SESSION,
         .verbose = FALSE
     };
     
     // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
+    for (int i = 0; i < argc; i++) {
         if (g_strcmp0(argv[i], "--source-bus-name") == 0 && i + 1 < argc) {
             config.source_bus_name = argv[++i];
         } else if (g_strcmp0(argv[i], "--source-object-path") == 0 && i + 1 < argc) {
@@ -529,11 +547,14 @@ int main(int argc, char *argv[])
             config.target_bus_type = parse_bus_type(argv[++i]);
         } else if (g_strcmp0(argv[i], "--verbose") == 0) {
             config.verbose = TRUE;
-        } else if (g_strcmp0(argv[i], "--help") == 0) {
+        } else if (g_strcmp0(argv[i], "--help") == 0 || g_strcmp0(argv[i], "-h") == 0 || argc == 1) {
             print_usage(argv[0]);
             return 0;
         }
     }
+
+    // Validate configuration
+    validateProxyConfigOrExit(config);
     
     // Set up signal handlers
     signal(SIGINT, signal_handler);
