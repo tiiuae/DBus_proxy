@@ -20,8 +20,9 @@
 struct ProxyConfig {
     std::string source_bus_name = "org.freedesktop.NetworkManager";
     std::string source_object_path = "/org/freedesktop/NetworkManager";
+    std::string source_bus_type = "system";  // "system" or "session"
     std::string proxy_bus_name = "org.example.Proxy";
-    std::string bus_type = "system";  // "system" or "session"
+    std::string proxy_bus_type = "system";   // "system" or "session"
     bool verbose = false;
     bool enable_logging = true;
     int timeout_ms = 30000;
@@ -79,10 +80,12 @@ struct ProxyConfig {
                 source_bus_name = value;
             } else if (key == "source_object_path") {
                 source_object_path = value;
+            } else if (key == "source_bus_type") {
+                source_bus_type = value;
             } else if (key == "proxy_bus_name") {
                 proxy_bus_name = value;
-            } else if (key == "bus_type") {
-                bus_type = value;
+            } else if (key == "proxy_bus_type") {
+                proxy_bus_type = value;
             } else if (key == "verbose") {
                 verbose = (value == "true" || value == "1" || value == "yes" || value == "on");
             } else if (key == "enable_logging") {
@@ -104,8 +107,9 @@ struct ProxyConfig {
         g_print("Configuration:\n");
         g_print("  source_bus_name: %s\n", source_bus_name.c_str());
         g_print("  source_object_path: %s\n", source_object_path.c_str());
+        g_print("  source_bus_type: %s\n", source_bus_type.c_str());
         g_print("  proxy_bus_name: %s\n", proxy_bus_name.c_str());
-        g_print("  bus_type: %s\n", bus_type.c_str());
+        g_print("  proxy_bus_type: %s\n", proxy_bus_type.c_str());
         g_print("  verbose: %s\n", verbose ? "true" : "false");
         g_print("  enable_logging: %s\n", enable_logging ? "true" : "false");
         g_print("  timeout_ms: %d\n", timeout_ms);
@@ -125,8 +129,12 @@ struct ProxyConfig {
             g_printerr("Error: proxy_bus_name cannot be empty\n");
             return false;
         }
-        if (bus_type != "system" && bus_type != "session") {
-            g_printerr("Error: bus_type must be 'system' or 'session'\n");
+        if (source_bus_type != "system" && source_bus_type != "session") {
+            g_printerr("Error: source_bus_type must be 'system' or 'session'\n");
+            return false;
+        }
+        if (proxy_bus_type != "system" && proxy_bus_type != "session") {
+            g_printerr("Error: proxy_bus_type must be 'system' or 'session'\n");
             return false;
         }
         if (timeout_ms <= 0) {
@@ -146,15 +154,14 @@ struct ProxyConfig {
         file << "# GDBus Proxy Configuration File\n";
         file << "# Lines starting with # or ; are comments\n\n";
         
-        file << "# Source service to proxy\n";
+        file << "# Source service to proxy (where to get data from)\n";
         file << "source_bus_name=" << source_bus_name << "\n";
-        file << "source_object_path=" << source_object_path << "\n\n";
+        file << "source_object_path=" << source_object_path << "\n";
+        file << "source_bus_type=" << source_bus_type << "\n\n";
         
-        file << "# Proxy service name\n";
-        file << "proxy_bus_name=" << proxy_bus_name << "\n\n";
-        
-        file << "# Bus type: 'system' or 'session'\n";
-        file << "bus_type=" << bus_type << "\n\n";
+        file << "# Proxy service (where to expose the interface)\n";
+        file << "proxy_bus_name=" << proxy_bus_name << "\n";
+        file << "proxy_bus_type=" << proxy_bus_type << "\n\n";
         
         file << "# Enable verbose output\n";
         file << "verbose=" << (verbose ? "true" : "false") << "\n\n";
@@ -175,7 +182,8 @@ struct ProxyConfig {
 
 static ProxyConfig config;
 static GDBusNodeInfo *introspection_data = NULL;
-static GDBusConnection *bus = NULL;
+static GDBusConnection *source_bus = NULL;  // Bus for connecting to source service
+static GDBusConnection *target_bus = NULL;  // Bus for exposing proxy service
 static FILE *log_fp = NULL;
 
 // Logging function
@@ -193,6 +201,99 @@ static void log_message(const char* format, ...) {
     }
     
     va_end(args);
+}
+
+// Forward property get requests to the source service
+static GVariant* handle_get_property(GDBusConnection *conn,
+                                    const char *sender,
+                                    const char *object_path,
+                                    const char *interface_name,
+                                    const char *property_name,
+                                    GError **error,
+                                    gpointer user_data)
+{
+    if (config.verbose) {
+        log_message("Getting property: %s.%s from %s\n", 
+                   interface_name, property_name, sender);
+    }
+    
+    GVariant *result = g_dbus_connection_call_sync(
+        source_bus,                            // Use source bus
+        config.source_bus_name.c_str(),
+        config.source_object_path.c_str(),
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        g_variant_new("(ss)", interface_name, property_name),
+        G_VARIANT_TYPE("(v)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        config.timeout_ms,
+        NULL,
+        error);
+    
+    if (!result) {
+        if (config.verbose) {
+            log_message("Failed to get property %s.%s: %s\n", 
+                       interface_name, property_name, 
+                       *error ? (*error)->message : "Unknown error");
+        }
+        return NULL;
+    }
+    
+    GVariant *value;
+    g_variant_get(result, "(v)", &value);
+    g_variant_unref(result);
+    
+    if (config.verbose) {
+        log_message("Property %s.%s retrieved successfully\n", interface_name, property_name);
+    }
+    
+    return value;
+}
+
+// Forward property set requests to the source service
+static gboolean handle_set_property(GDBusConnection *conn,
+                                   const char *sender,
+                                   const char *object_path,
+                                   const char *interface_name,
+                                   const char *property_name,
+                                   GVariant *value,
+                                   GError **error,
+                                   gpointer user_data)
+{
+    if (config.verbose) {
+        log_message("Setting property: %s.%s from %s\n", 
+                   interface_name, property_name, sender);
+    }
+    
+    GVariant *result = g_dbus_connection_call_sync(
+        source_bus,                            // Use source bus
+        config.source_bus_name.c_str(),
+        config.source_object_path.c_str(),
+        "org.freedesktop.DBus.Properties",
+        "Set",
+        g_variant_new("(ssv)", interface_name, property_name, value),
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        config.timeout_ms,
+        NULL,
+        error);
+    
+    if (!result) {
+        if (config.verbose) {
+            log_message("Failed to set property %s.%s: %s\n", 
+                       interface_name, property_name, 
+                       *error ? (*error)->message : "Unknown error");
+        }
+        return FALSE;
+    }
+    
+    g_variant_unref(result);
+    
+    if (config.verbose) {
+        log_message("Property %s.%s set successfully\n", interface_name, property_name);
+    }
+    
+    return TRUE;
 }
 
 // Forward method calls to the source service
@@ -242,99 +343,6 @@ static void handle_method_call(GDBusConnection *conn,
         invocation);
 }
 
-// Forward property get requests to the source service
-static GVariant* handle_get_property(GDBusConnection *conn,
-                                    const char *sender,
-                                    const char *object_path,
-                                    const char *interface_name,
-                                    const char *property_name,
-                                    GError **error,
-                                    gpointer user_data)
-{
-    if (config.verbose) {
-        log_message("Getting property: %s.%s from %s\n", 
-                   interface_name, property_name, sender);
-    }
-    
-    GVariant *result = g_dbus_connection_call_sync(
-        bus,
-        config.source_bus_name.c_str(),
-        config.source_object_path.c_str(),
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        g_variant_new("(ss)", interface_name, property_name),
-        G_VARIANT_TYPE("(v)"),
-        G_DBUS_CALL_FLAGS_NONE,
-        config.timeout_ms,
-        NULL,
-        error);
-    
-    if (!result) {
-        if (config.verbose) {
-            log_message("Failed to get property %s.%s: %s\n", 
-                       interface_name, property_name, 
-                       *error ? (*error)->message : "Unknown error");
-        }
-        return NULL;
-    }
-    
-    GVariant *value;
-    g_variant_get(result, "(v)", &value);
-    g_variant_unref(result);
-    
-    if (config.verbose) {
-        log_message("Property %s.%s retrieved successfully\n", interface_name, property_name);
-    }
-    
-    return value;
-}
-
-// Forward property set requests to the source service
-static gboolean handle_set_property(GDBusConnection *conn,
-                                   const char *sender,
-                                   const char *object_path,
-                                   const char *interface_name,
-                                   const char *property_name,
-                                   GVariant *value,
-                                   GError **error,
-                                   gpointer user_data)
-{
-    if (config.verbose) {
-        log_message("Setting property: %s.%s from %s\n", 
-                   interface_name, property_name, sender);
-    }
-    
-    GVariant *result = g_dbus_connection_call_sync(
-        bus,
-        config.source_bus_name.c_str(),
-        config.source_object_path.c_str(),
-        "org.freedesktop.DBus.Properties",
-        "Set",
-        g_variant_new("(ssv)", interface_name, property_name, value),
-        NULL,
-        G_DBUS_CALL_FLAGS_NONE,
-        config.timeout_ms,
-        NULL,
-        error);
-    
-    if (!result) {
-        if (config.verbose) {
-            log_message("Failed to set property %s.%s: %s\n", 
-                       interface_name, property_name, 
-                       *error ? (*error)->message : "Unknown error");
-        }
-        return FALSE;
-    }
-    
-    g_variant_unref(result);
-    
-    if (config.verbose) {
-        log_message("Property %s.%s set successfully\n", interface_name, property_name);
-    }
-    
-    return TRUE;
-}
-
 // Forward signals from the source to the proxy (including property changes)
 static void on_signal_received(GDBusConnection *conn,
                                const char *sender_name,
@@ -350,7 +358,7 @@ static void on_signal_received(GDBusConnection *conn,
     
     GError *error = NULL;
     gboolean success = g_dbus_connection_emit_signal(
-        bus,
+        target_bus,                            // Use target bus to emit signals
         NULL,                                  // destination (broadcast)
         config.source_object_path.c_str(),    // object path
         interface_name,
@@ -372,7 +380,7 @@ static void subscribe_to_properties_changed()
     }
     
     guint subscription_id = g_dbus_connection_signal_subscribe(
-        bus,
+        source_bus,                            // Use source bus to subscribe to signals
         config.source_bus_name.c_str(),
         "org.freedesktop.DBus.Properties",
         "PropertiesChanged",
@@ -471,24 +479,43 @@ int main(int argc, char* argv[])
         }
     }
     
-    // Connect to bus
+    // Connect to source bus (where we read data from)
     GError *error = NULL;
-    GBusType bus_type = (config.bus_type == "system") ? G_BUS_TYPE_SYSTEM : G_BUS_TYPE_SESSION;
+    GBusType source_bus_type = (config.source_bus_type == "system") ? G_BUS_TYPE_SYSTEM : G_BUS_TYPE_SESSION;
     
-    bus = g_bus_get_sync(bus_type, NULL, &error);
-    if (!bus) {
-        g_printerr("Failed to connect to %s bus: %s\n", config.bus_type.c_str(), error->message);
+    source_bus = g_bus_get_sync(source_bus_type, NULL, &error);
+    if (!source_bus) {
+        g_printerr("Failed to connect to source %s bus: %s\n", config.source_bus_type.c_str(), error->message);
         g_error_free(error);
         return 1;
     }
     
-    log_message("Connected to %s bus\n", config.bus_type.c_str());
+    log_message("Connected to source %s bus\n", config.source_bus_type.c_str());
+    
+    // Connect to target bus (where we expose proxy service)
+    GBusType target_bus_type = (config.proxy_bus_type == "system") ? G_BUS_TYPE_SYSTEM : G_BUS_TYPE_SESSION;
+    
+    if (config.source_bus_type == config.proxy_bus_type) {
+        // Same bus type, reuse connection
+        target_bus = source_bus;
+        g_object_ref(target_bus);
+        log_message("Using same bus for both source and target\n");
+    } else {
+        // Different bus types, create separate connection
+        target_bus = g_bus_get_sync(target_bus_type, NULL, &error);
+        if (!target_bus) {
+            g_printerr("Failed to connect to target %s bus: %s\n", config.proxy_bus_type.c_str(), error->message);
+            g_error_free(error);
+            return 1;
+        }
+        log_message("Connected to target %s bus\n", config.proxy_bus_type.c_str());
+    }
     
     // Introspect source object
     log_message("Introspecting %s at %s\n", config.source_bus_name.c_str(), config.source_object_path.c_str());
     
     GVariant *xml = g_dbus_connection_call_sync(
-        bus,
+        source_bus,                            // Use source bus for introspection
         config.source_bus_name.c_str(),
         config.source_object_path.c_str(),
         "org.freedesktop.DBus.Introspectable",
@@ -534,7 +561,7 @@ int main(int argc, char* argv[])
         log_message("Registering interface: %s\n", iface->name);
         
         guint registration_id = g_dbus_connection_register_object(
-            bus,
+            target_bus,                           // Use target bus to register proxy interface
             config.source_object_path.c_str(),
             iface,
             &vtable,
