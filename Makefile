@@ -4,7 +4,7 @@ CXXFLAGS := -Wall -Wextra -g
 PKG_CONFIG_FLAGS := $(shell pkg-config --cflags --libs glib-2.0 gio-2.0)
 
 # Targets
-TARGET := DBus_proxy
+TARGET := dbus_proxy
 SRC := DBus_proxy.cpp
 OBJ := $(SRC:.cpp=.o)
 
