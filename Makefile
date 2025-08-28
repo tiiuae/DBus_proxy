@@ -5,7 +5,7 @@ PKG_CONFIG_FLAGS := $(shell pkg-config --cflags --libs glib-2.0 gio-2.0)
 
 # Targets
 TARGET := dbus-proxy
-SRC := DBus_proxy.cpp
+SRC := dbus-proxy.cpp
 OBJ := $(SRC:.cpp=.o)
 
 # Default target
