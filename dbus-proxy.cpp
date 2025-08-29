@@ -401,13 +401,16 @@ static gboolean setup_proxy_interfaces()
     return TRUE;
 }
 
-// ...existing code...
-static void on_bus_name_acquired(GDBusConnection *conn, const gchar *name, gpointer user_data)
+static void on_bus_name_acquired(G_GNUC_UNUSED GDBusConnection *conn,
+                                 const gchar *name,
+                                 gpointer user_data G_GNUC_UNUSED)
 {
     log_info("Name acquired: %s", name);
 }
 
-static void on_bus_name_lost(GDBusConnection *conn, const gchar *name, gpointer user_data)
+static void on_bus_name_lost(G_GNUC_UNUSED GDBusConnection *conn,
+                             const gchar *name,
+                             gpointer user_data G_GNUC_UNUSED)
 {
     log_error("Name lost or failed to acquire: %s", name);
 }
@@ -422,9 +425,9 @@ static gboolean acquire_bus_name()
         proxy_state->config.proxy_bus_name,
         G_BUS_NAME_OWNER_FLAGS_NONE,
         on_bus_name_acquired,
-        NULL, // name_acquired_handler (we use on_bus_name_acquired)
         on_bus_name_lost,
-        NULL // user_data
+        NULL,
+        NULL
     );
 
     if (owner_id == 0) {
