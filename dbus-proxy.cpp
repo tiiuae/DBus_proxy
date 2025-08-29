@@ -424,8 +424,7 @@ static gboolean acquire_bus_name()
         on_bus_name_acquired,
         NULL, // name_acquired_handler (we use on_bus_name_acquired)
         on_bus_name_lost,
-        NULL, // user_data
-        NULL  // user_data_free_func
+        NULL // user_data
     );
 
     if (owner_id == 0) {
