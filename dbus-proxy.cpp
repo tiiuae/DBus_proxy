@@ -32,6 +32,7 @@ typedef struct {
     GHashTable *registered_objects;  // Track registered object IDs
     GHashTable *signal_subscriptions; // Track signal subscription IDs
     ProxyConfig config;
+    guint name_owner_watch_id;
 } ProxyState;
 
 static ProxyState *proxy_state = NULL;
@@ -401,6 +402,32 @@ static gboolean setup_proxy_interfaces()
     return TRUE;
 }
 
+static void on_bus_acquired_for_owner(GDBusConnection *connection,
+                                      const gchar *name,
+                                      gpointer user_data G_GNUC_UNUSED)
+{
+    log_info("Bus acquired for name: %s", name ? name : "(none)");
+    if (!proxy_state) return;
+
+    /* keep a reference to the connection so we can use it later */
+    if (proxy_state->target_bus) {
+        g_object_unref(proxy_state->target_bus);
+        proxy_state->target_bus = NULL;
+    }
+    proxy_state->target_bus = g_object_ref(connection);
+
+    /* Now register interfaces & subscribe to signals on this connection */
+    if (!setup_proxy_interfaces()) {
+        log_error("Failed to set up interfaces on target bus");
+        /* If setup fails, stop owning the name */
+        if (proxy_state->name_owner_watch_id) {
+            g_bus_unown_name(proxy_state->name_owner_watch_id);
+            proxy_state->name_owner_watch_id = 0;
+        }
+    }
+}
+
+#if 0
 static void on_bus_name_acquired(G_GNUC_UNUSED GDBusConnection *conn,
                                  const gchar *name,
                                  gpointer user_data G_GNUC_UNUSED)
@@ -413,8 +440,25 @@ static void on_bus_name_lost(G_GNUC_UNUSED GDBusConnection *conn,
                              gpointer user_data G_GNUC_UNUSED)
 {
     log_error("Name lost or failed to acquire: %s", name);
+    /* Optionally query owner or take recovery actions here */
+}
+#endif
+static void on_name_acquired_log(G_GNUC_UNUSED GDBusConnection *conn,
+                                 const gchar *name,
+                                 gpointer user_data G_GNUC_UNUSED)
+{
+    log_info("Name successfully acquired: %s", name);
 }
 
+static void on_name_lost_log(G_GNUC_UNUSED GDBusConnection *conn,
+                             const gchar *name,
+                             gpointer user_data G_GNUC_UNUSED)
+{
+    log_error("Name lost or failed to acquire: %s", name);
+    /* Optionally query owner or take recovery actions here */
+}
+
+#if 0
 static gboolean acquire_bus_name()
 {
     log_info("Acquiring bus name: %s", proxy_state->config.proxy_bus_name);
@@ -438,6 +482,7 @@ static gboolean acquire_bus_name()
     log_info("Started owning process for bus name (owner id %u)", owner_id);
     return TRUE;
 }
+#endif
 
 // Cleanup function
 static void cleanup_proxy_state()
@@ -600,26 +645,31 @@ int main(int argc, char *argv[])
         cleanup_proxy_state();
         return 1;
     }
-    
-    // Set up proxy interfaces and signal forwarding
-    if (!setup_proxy_interfaces()) {
-        cleanup_proxy_state();
-        return 1;
-    }
-    
-    // Acquire bus name on target bus
-    if (!acquire_bus_name()) {
-        cleanup_proxy_state();
-        return 1;
-    }
-    
-    log_info("Cross-bus proxy is running and ready to forward calls");
-    log_info("Press Ctrl+C to stop");
-    
-    // Run main loop
+
+    /*
+     * Start owning the proxy name on the target bus and get notified
+     * when the bus connection is available (bus-acquired). In
+     * on_bus_acquired_for_owner we register objects on that connection.
+     */
+    proxy_state->name_owner_watch_id = g_bus_own_name(
+        proxy_state->config.target_bus_type,               // session/system
+        proxy_state->config.proxy_bus_name,                // requested name
+        G_BUS_NAME_OWNER_FLAGS_NONE,
+        on_bus_acquired_for_owner,     // bus-acquired
+        on_name_acquired_log,         // name-acquired
+        on_name_lost_log,             // name-lost
+        NULL, NULL);
+
+    // run main loop as before
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);
-    
+
+    // Cleanup: unown name & cleanup state
+    if (proxy_state && proxy_state->name_owner_watch_id) {
+        g_bus_unown_name(proxy_state->name_owner_watch_id);
+        proxy_state->name_owner_watch_id = 0;
+    }
+
     // Cleanup
     g_main_loop_unref(loop);
     cleanup_proxy_state();
