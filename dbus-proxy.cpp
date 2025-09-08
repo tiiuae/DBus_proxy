@@ -33,6 +33,7 @@ typedef struct {
     GHashTable *signal_subscriptions; // Track signal subscription IDs
     ProxyConfig config;
     guint name_owner_watch_id;
+    guint catch_all_subscription_id; // For catching all signals
 } ProxyState;
 
 static ProxyState *proxy_state = NULL;
@@ -184,22 +185,33 @@ static gboolean handle_set_property(GDBusConnection *connection G_GNUC_UNUSED,
     return FALSE;
 }
 
-// Forward signals from source bus to target bus
-static void on_signal_received(GDBusConnection *connection G_GNUC_UNUSED,
-                               const char *sender_name,
-                               const char *object_path G_GNUC_UNUSED,
-                               const char *interface_name,
-                               const char *signal_name,
-                               GVariant *parameters,
-                               gpointer user_data G_GNUC_UNUSED)
+// Forward signals from source bus to target bus - catch-all version
+static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
+                                        const char *sender_name,
+                                        const char *object_path,
+                                        const char *interface_name,
+                                        const char *signal_name,
+                                        GVariant *parameters,
+                                        gpointer user_data G_GNUC_UNUSED)
 {
-    log_verbose("Signal received: %s.%s from %s", interface_name, signal_name, sender_name);
+    // Only forward signals from our specific source
+    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
+        return;
+    }
+    
+    // Only forward signals from our specific object path (or child paths)
+    if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
+        return;
+    }
+    
+    log_verbose("Signal received (catch-all): %s.%s from %s at %s", 
+                interface_name, signal_name, sender_name, object_path);
     
     GError *error = NULL;
     gboolean success = g_dbus_connection_emit_signal(
         proxy_state->target_bus,
         NULL, // Broadcast to all subscribers
-        proxy_state->config.source_object_path,
+        object_path, // Use the original object path
         interface_name,
         signal_name,
         parameters,
@@ -222,13 +234,38 @@ static void on_properties_changed(GDBusConnection *connection,
                                   GVariant *parameters,
                                   gpointer user_data)
 {
+    // Only forward signals from our specific source
+    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
+        return;
+    }
+    
+    // Only forward signals from our specific object path (or child paths)
+    if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
+        return;
+    }
+    
     const char *changed_interface;
     g_variant_get_child(parameters, 0, "&s", &changed_interface);
     
-    log_verbose("Properties changed signal for interface: %s", changed_interface);
+    log_verbose("Properties changed signal for interface: %s at %s", changed_interface, object_path);
     
     // Forward the PropertiesChanged signal
-    on_signal_received(connection, sender_name, object_path, interface_name, signal_name, parameters, user_data);
+    GError *error = NULL;
+    gboolean success = g_dbus_connection_emit_signal(
+        proxy_state->target_bus,
+        NULL, // Broadcast to all subscribers
+        object_path, // Use the original object path
+        interface_name,
+        signal_name,
+        parameters,
+        &error);
+    
+    if (success) {
+        log_verbose("PropertiesChanged signal forwarded successfully");
+    } else {
+        log_error("Failed to forward PropertiesChanged signal: %s", error ? error->message : "Unknown error");
+        if (error) g_error_free(error);
+    }
 }
 
 // Initialize proxy state
@@ -238,6 +275,7 @@ static gboolean init_proxy_state(const ProxyConfig *config)
     proxy_state->config = *config;
     proxy_state->registered_objects = g_hash_table_new(g_direct_hash, g_direct_equal);
     proxy_state->signal_subscriptions = g_hash_table_new(g_direct_hash, g_direct_equal);
+    proxy_state->catch_all_subscription_id = 0;
     
     return TRUE;
 }
@@ -316,7 +354,58 @@ static gboolean fetch_introspection_data()
     return TRUE;
 }
 
-// Register interfaces and set up signal forwarding
+// Setup signal forwarding with both catch-all and specific PropertiesChanged handling
+static gboolean setup_signal_forwarding()
+{
+    log_info("Setting up signal forwarding");
+    
+    // Subscribe to ALL signals from the source bus name
+    proxy_state->catch_all_subscription_id = g_dbus_connection_signal_subscribe(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name, // sender (our source service)
+        NULL,                                // interface_name (all interfaces)
+        NULL,                                // member (all signals)
+        NULL,                                // object_path (all paths - we filter in callback)
+        NULL,                                // arg0 (no filtering)
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        on_signal_received_catchall,
+        NULL,
+        NULL);
+    
+    if (proxy_state->catch_all_subscription_id == 0) {
+        log_error("Failed to set up catch-all signal subscription");
+        return FALSE;
+    }
+    
+    log_info("Catch-all signal subscription established (ID: %u)", proxy_state->catch_all_subscription_id);
+    
+    // Also subscribe specifically to PropertiesChanged signals for better handling
+    guint props_subscription_id = g_dbus_connection_signal_subscribe(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        NULL, // All object paths (we filter in callback)
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        on_properties_changed,
+        NULL,
+        NULL);
+    
+    if (props_subscription_id == 0) {
+        log_error("Failed to set up PropertiesChanged signal subscription");
+        return FALSE;
+    }
+    
+    g_hash_table_insert(proxy_state->signal_subscriptions,
+                       GUINT_TO_POINTER(props_subscription_id),
+                       g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
+    
+    log_info("PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
+    return TRUE;
+}
+
+// Register interfaces
 static gboolean setup_proxy_interfaces()
 {
     if (!proxy_state->introspection_data->interfaces) {
@@ -328,7 +417,7 @@ static gboolean setup_proxy_interfaces()
         .method_call = handle_method_call,
         .get_property = handle_get_property,
         .set_property = handle_set_property,
-        .padding = {0} // Initialize padding array
+        .padding = {0}
     };
     
     // Register each interface on the target bus
@@ -343,8 +432,8 @@ static gboolean setup_proxy_interfaces()
             proxy_state->config.source_object_path,
             iface,
             &vtable,
-            NULL, // user_data
-            NULL, // user_data_free_func
+            NULL,
+            NULL,
             &error);
         
         if (registration_id == 0) {
@@ -357,48 +446,15 @@ static gboolean setup_proxy_interfaces()
                            GUINT_TO_POINTER(registration_id), 
                            g_strdup(iface->name));
         
-        // Subscribe to all signals for this interface
-        if (iface->signals) {
-            for (int j = 0; iface->signals[j]; j++) {
-                log_verbose("Subscribing to signal: %s.%s", iface->name, iface->signals[j]->name);
-                
-                guint subscription_id = g_dbus_connection_signal_subscribe(
-                    proxy_state->source_bus,
-                    proxy_state->config.source_bus_name,
-                    iface->name,
-                    iface->signals[j]->name,
-                    proxy_state->config.source_object_path,
-                    NULL, // arg0
-                    G_DBUS_SIGNAL_FLAGS_NONE,
-                    on_signal_received,
-                    NULL, // user_data
-                    NULL); // user_data_free_func
-                
-                g_hash_table_insert(proxy_state->signal_subscriptions,
-                                   GUINT_TO_POINTER(subscription_id),
-                                   g_strdup_printf("%s.%s", iface->name, iface->signals[j]->name));
-            }
-        }
+        log_verbose("Interface %s registered with ID %u", iface->name, registration_id);
     }
     
-    // Subscribe to PropertiesChanged signals
-    guint props_subscription_id = g_dbus_connection_signal_subscribe(
-        proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
-        "org.freedesktop.DBus.Properties",
-        "PropertiesChanged",
-        proxy_state->config.source_object_path,
-        NULL,
-        G_DBUS_SIGNAL_FLAGS_NONE,
-        on_properties_changed,
-        NULL,
-        NULL);
+    // Set up signal forwarding (both catch-all and PropertiesChanged)
+    if (!setup_signal_forwarding()) {
+        return FALSE;
+    }
     
-    g_hash_table_insert(proxy_state->signal_subscriptions,
-                       GUINT_TO_POINTER(props_subscription_id),
-                       g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
-    
-    log_info("All interfaces registered and signal subscriptions set up");
+    log_info("All interfaces registered and signal forwarding set up");
     return TRUE;
 }
 
@@ -409,17 +465,16 @@ static void on_bus_acquired_for_owner(GDBusConnection *connection,
     log_info("Bus acquired for name: %s", name ? name : "(none)");
     if (!proxy_state) return;
 
-    /* keep a reference to the connection so we can use it later */
+    // Keep a reference to the connection
     if (proxy_state->target_bus) {
         g_object_unref(proxy_state->target_bus);
         proxy_state->target_bus = NULL;
     }
     proxy_state->target_bus = g_object_ref(connection);
 
-    /* Now register interfaces & subscribe to signals on this connection */
+    // Register interfaces & set up signal forwarding
     if (!setup_proxy_interfaces()) {
         log_error("Failed to set up interfaces on target bus");
-        /* If setup fails, stop owning the name */
         if (proxy_state->name_owner_watch_id) {
             g_bus_unown_name(proxy_state->name_owner_watch_id);
             proxy_state->name_owner_watch_id = 0;
@@ -427,22 +482,6 @@ static void on_bus_acquired_for_owner(GDBusConnection *connection,
     }
 }
 
-#if 0
-static void on_bus_name_acquired(G_GNUC_UNUSED GDBusConnection *conn,
-                                 const gchar *name,
-                                 gpointer user_data G_GNUC_UNUSED)
-{
-    log_info("Name acquired: %s", name);
-}
-
-static void on_bus_name_lost(G_GNUC_UNUSED GDBusConnection *conn,
-                             const gchar *name,
-                             gpointer user_data G_GNUC_UNUSED)
-{
-    log_error("Name lost or failed to acquire: %s", name);
-    /* Optionally query owner or take recovery actions here */
-}
-#endif
 static void on_name_acquired_log(G_GNUC_UNUSED GDBusConnection *conn,
                                  const gchar *name,
                                  gpointer user_data G_GNUC_UNUSED)
@@ -455,34 +494,7 @@ static void on_name_lost_log(G_GNUC_UNUSED GDBusConnection *conn,
                              gpointer user_data G_GNUC_UNUSED)
 {
     log_error("Name lost or failed to acquire: %s", name);
-    /* Optionally query owner or take recovery actions here */
 }
-
-#if 0
-static gboolean acquire_bus_name()
-{
-    log_info("Acquiring bus name: %s", proxy_state->config.proxy_bus_name);
-
-    // Use the already-open target connection so the name owner and registered objects share the same connection.
-    guint owner_id = g_bus_own_name_on_connection(
-        G_DBUS_CONNECTION(proxy_state->target_bus),
-        proxy_state->config.proxy_bus_name,
-        G_BUS_NAME_OWNER_FLAGS_NONE,
-        on_bus_name_acquired,
-        on_bus_name_lost,
-        NULL,
-        NULL
-    );
-
-    if (owner_id == 0) {
-        log_error("Failed to start owning bus name: %s", proxy_state->config.proxy_bus_name);
-        return FALSE;
-    }
-
-    log_info("Started owning process for bus name (owner id %u)", owner_id);
-    return TRUE;
-}
-#endif
 
 // Cleanup function
 static void cleanup_proxy_state()
@@ -501,7 +513,13 @@ static void cleanup_proxy_state()
         g_hash_table_destroy(proxy_state->registered_objects);
     }
     
-    // Unsubscribe from signals
+    // Unsubscribe from catch-all signal
+    if (proxy_state->catch_all_subscription_id && proxy_state->source_bus) {
+        g_dbus_connection_signal_unsubscribe(proxy_state->source_bus, proxy_state->catch_all_subscription_id);
+        proxy_state->catch_all_subscription_id = 0;
+    }
+    
+    // Clean up individual signal subscriptions (like PropertiesChanged)
     if (proxy_state->signal_subscriptions) {
         GHashTableIter iter;
         gpointer key, value;
@@ -564,18 +582,18 @@ static void print_usage(const char *program_name)
 }
 
 // Validate required proxy configuration parameters
-void validateProxyConfigOrExit(const ProxyConfig& config) 
+static void validateProxyConfigOrExit(const ProxyConfig *config) 
 {
-    if (!config.source_bus_name || !strlen(config.source_bus_name)) {
-        log_error("Error: source_bus_name is required!\n");
+    if (!config->source_bus_name || !strlen(config->source_bus_name)) {
+        log_error("Error: source_bus_name is required!");
         exit(EXIT_FAILURE);
     }    
-    if (!config.source_object_path || !strlen(config.source_object_path)) {
-        log_error("Error: source_object_path is required!\n");
+    if (!config->source_object_path || !strlen(config->source_object_path)) {
+        log_error("Error: source_object_path is required!");
         exit(EXIT_FAILURE);
     }
-    if (!config.proxy_bus_name || !strlen(config.proxy_bus_name)) {
-        log_error("Error: proxy_bus_name is required!\n");
+    if (!config->proxy_bus_name || !strlen(config->proxy_bus_name)) {
+        log_error("Error: proxy_bus_name is required!");
         exit(EXIT_FAILURE);
     }
 }
@@ -613,7 +631,7 @@ int main(int argc, char *argv[])
     }
 
     // Validate configuration
-    validateProxyConfigOrExit(config);
+    validateProxyConfigOrExit(&config);
     
     // Set up signal handlers
     signal(SIGINT, signal_handler);
@@ -646,31 +664,26 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /*
-     * Start owning the proxy name on the target bus and get notified
-     * when the bus connection is available (bus-acquired). In
-     * on_bus_acquired_for_owner we register objects on that connection.
-     */
+    // Start owning the proxy name on the target bus
     proxy_state->name_owner_watch_id = g_bus_own_name(
-        proxy_state->config.target_bus_type,               // session/system
-        proxy_state->config.proxy_bus_name,                // requested name
+        proxy_state->config.target_bus_type,
+        proxy_state->config.proxy_bus_name,
         G_BUS_NAME_OWNER_FLAGS_NONE,
-        on_bus_acquired_for_owner,     // bus-acquired
-        on_name_acquired_log,         // name-acquired
-        on_name_lost_log,             // name-lost
+        on_bus_acquired_for_owner,
+        on_name_acquired_log,
+        on_name_lost_log,
         NULL, NULL);
 
-    // run main loop as before
+    // Run main loop
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);
 
-    // Cleanup: unown name & cleanup state
+    // Cleanup
     if (proxy_state && proxy_state->name_owner_watch_id) {
         g_bus_unown_name(proxy_state->name_owner_watch_id);
         proxy_state->name_owner_watch_id = 0;
     }
 
-    // Cleanup
     g_main_loop_unref(loop);
     cleanup_proxy_state();
     
