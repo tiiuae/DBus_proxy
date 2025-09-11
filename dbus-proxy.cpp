@@ -34,8 +34,15 @@ typedef struct {
     ProxyConfig config;
     guint name_owner_watch_id;
     guint catch_all_subscription_id; // For catching all signals
+    GHashTable *proxied_objects; // object_path -> ProxiedObject*
 } ProxyState;
 
+// Structure to track proxied objects
+typedef struct {
+    char *object_path;
+    GDBusNodeInfo *node_info;
+    GHashTable *registration_ids; // interface_name -> registration_id
+} ProxiedObject;
 static ProxyState *proxy_state = NULL;
 
 // Logging functions
@@ -69,6 +76,429 @@ static void log_info(const char *format, ...)
     g_vprintf(format, args);
     g_print("\n");
     va_end(args);
+}
+
+static gboolean proxy_single_object(const char *object_path, GDBusNodeInfo *node_info);
+
+// Free function for ProxiedObject
+static void free_proxied_object(gpointer data)
+{
+    ProxiedObject *obj = (ProxiedObject*)data;
+    if (!obj) return;
+    
+    g_free(obj->object_path);
+    if (obj->node_info) {
+        g_dbus_node_info_unref(obj->node_info);
+    }
+    if (obj->registration_ids) {
+        g_hash_table_destroy(obj->registration_ids);
+    }
+    g_free(obj);
+}
+
+// Recursively discover and proxy all objects starting from a base path
+static gboolean discover_and_proxy_object_tree(const char *base_path)
+{
+    GError *error = NULL;
+    
+    log_info("Discovering object tree starting from: %s", base_path);
+    
+    // Get introspection data for this path
+    GVariant *xml_variant = g_dbus_connection_call_sync(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        base_path,
+        "org.freedesktop.DBus.Introspectable",
+        "Introspect",
+        NULL,
+        G_VARIANT_TYPE("(s)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        10000, // 10 second timeout - increased for slow systems
+        NULL,
+        &error);
+    
+    if (!xml_variant) {
+        // Some objects might not be introspectable, that's ok
+        log_verbose("Could not introspect %s: %s", base_path, error ? error->message : "Unknown error");
+        if (error) {
+            // Only log as error if it's not a simple "no such object" error
+            if (error->domain == G_DBUS_ERROR && error->code == G_DBUS_ERROR_UNKNOWN_OBJECT) {
+                log_verbose("Object %s does not exist, skipping", base_path);
+            } else {
+                log_error("Introspection error for %s: %s", base_path, error->message);
+            }
+            g_error_free(error);
+        }
+        return TRUE; // Continue with other objects
+    }
+    
+    const char *xml_data;
+    g_variant_get(xml_variant, "(s)", &xml_data);
+    
+    log_verbose("Introspection XML for %s (%zu bytes):\n%s", base_path, strlen(xml_data), xml_data);
+    
+    GDBusNodeInfo *node_info = g_dbus_node_info_new_for_xml(xml_data, &error);
+    g_variant_unref(xml_variant);
+    
+    if (!node_info) {
+        log_error("Failed to parse introspection XML for %s: %s", base_path, error ? error->message : "Unknown");
+        if (error) g_error_free(error);
+        return FALSE;
+    }
+    
+    // Show what interfaces we found
+    if (node_info->interfaces) {
+        for (int i = 0; node_info->interfaces[i]; i++) {
+            log_verbose("Found interface: %s", node_info->interfaces[i]->name);
+        }
+    }
+    
+    // Show what child nodes we found
+    if (node_info->nodes) {
+        for (int i = 0; node_info->nodes[i]; i++) {
+            const char *child_name = node_info->nodes[i]->path;
+            log_verbose("Found child node: %s", child_name ? child_name : "(unnamed)");
+        }
+    } else {
+        log_verbose("No child nodes found for %s", base_path);
+    }
+    
+    // Proxy this object if it has interfaces
+    if (!proxy_single_object(base_path, node_info)) {
+        g_dbus_node_info_unref(node_info);
+        return FALSE;
+    }
+    
+    // Recursively handle child nodes
+    if (node_info->nodes) {
+        for (int i = 0; node_info->nodes[i]; i++) {
+            const char *child_name = node_info->nodes[i]->path;
+            if (!child_name || strlen(child_name) == 0) {
+                log_verbose("Skipping unnamed child node");
+                continue;
+            }
+            
+            // Build full child path
+            char *child_path;
+            if (g_str_has_suffix(base_path, "/")) {
+                child_path = g_strdup_printf("%s%s", base_path, child_name);
+            } else {
+                child_path = g_strdup_printf("%s/%s", base_path, child_name);
+            }
+            
+            log_verbose("Recursively processing child: %s", child_path);
+            
+            // Recurse into child (don't fail if child fails)
+            discover_and_proxy_object_tree(child_path);
+            
+            g_free(child_path);
+        }
+    }
+    
+    g_dbus_node_info_unref(node_info);
+    return TRUE;
+}
+
+// Generic method call handler that works for any object path
+static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection,
+                                      const char *sender,
+                                      const char *object_path,
+                                      const char *interface_name,
+                                      const char *method_name,
+                                      GVariant *parameters,
+                                      GDBusMethodInvocation *invocation,
+                                      gpointer user_data)
+{
+    const char *target_object_path = (const char*)user_data;
+    
+    log_verbose("Method call: %s.%s on %s from %s (forwarding to %s)", 
+                interface_name, method_name, object_path, sender, target_object_path);
+    #if 0
+    // jarekk: Handle D-Bus daemon method calls.
+    // Maybe it's better to handle all requests to /org/freedesktop/DBus in a normal way?
+    // The code below is redundant with setup_proxy_interfaces()...
+
+    // Special case: Route D-Bus daemon calls to the D-Bus daemon on source bus
+    if (g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
+        log_verbose(">>>>>> D-Bus daemon method call: %s.%s from %s (routing to source bus D-Bus daemon)", 
+                    interface_name, method_name, sender);
+        
+        // jarekk
+        g_print(">>>> Routing D-Bus daemon call %s.%s to source bus\n", interface_name, method_name);
+        g_dbus_connection_call(
+            proxy_state->source_bus,
+            "org.freedesktop.DBus",          // D-Bus daemon service name
+            "/org/freedesktop/DBus",         // D-Bus daemon object path  
+            interface_name,
+            method_name,
+            parameters,
+            NULL,
+            G_DBUS_CALL_FLAGS_NONE,
+            -1,
+            NULL,
+            (GAsyncReadyCallback)[](GObject *source, GAsyncResult *res, gpointer user_data) {
+                GDBusMethodInvocation *inv = (GDBusMethodInvocation *)user_data;
+                GError *error = NULL;
+                GVariant *result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
+                
+                if (result) {
+                    log_verbose("D-Bus daemon method call successful");
+                    g_dbus_method_invocation_return_value(inv, result);
+                } else {
+                    log_error("D-Bus daemon method call failed: %s", error ? error->message : "Unknown error");
+                    g_dbus_method_invocation_return_gerror(inv, error);
+                    if (error) g_error_free(error);
+                }
+            },
+            invocation);
+        return;
+    }
+    #endif
+
+    // Forward the call to the source bus using the original object path
+    g_dbus_connection_call(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        target_object_path, // Use the original object path from source bus
+        interface_name,
+        method_name,
+        parameters,
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        (GAsyncReadyCallback)[](GObject *source, GAsyncResult *res, gpointer user_data) {
+            GDBusMethodInvocation *inv = (GDBusMethodInvocation *)user_data;
+            GError *error = NULL;
+            GVariant *result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
+            
+            if (result) {
+                log_verbose("Method call successful, returning result");
+                g_dbus_method_invocation_return_value(inv, result);
+            } else {
+                log_error("Method call failed: %s", error ? error->message : "Unknown error");
+                g_dbus_method_invocation_return_gerror(inv, error);
+                if (error) g_error_free(error);
+            }
+        },
+        invocation);
+}
+
+// Generic property handlers that work for any object path  
+static GVariant *handle_get_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
+                                            const char *sender,
+                                            const char *object_path,
+                                            const char *interface_name,
+                                            const char *property_name,
+                                            GError **error,
+                                            gpointer user_data)
+{
+    const char *target_object_path = (const char*)user_data;
+    
+    log_verbose("Property get: %s.%s on %s from %s (forwarding to %s)", 
+                interface_name, property_name, object_path, sender, target_object_path);
+    
+    GVariant *result = g_dbus_connection_call_sync(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        target_object_path,
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        g_variant_new("(ss)", interface_name, property_name),
+        G_VARIANT_TYPE("(v)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        error);
+    
+    if (result) {
+        GVariant *value;
+        g_variant_get(result, "(v)", &value);
+        g_variant_unref(result);
+        return value;
+    }
+    
+    return NULL;
+}
+
+static gboolean handle_set_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
+                                           const char *sender,
+                                           const char *object_path,
+                                           const char *interface_name,
+                                           const char *property_name,
+                                           GVariant *value,
+                                           GError **error,
+                                           gpointer user_data)
+{
+    const char *target_object_path = (const char*)user_data;
+    
+    log_verbose("Property set: %s.%s on %s from %s (forwarding to %s)", 
+                interface_name, property_name, object_path, sender, target_object_path);
+    
+    GVariant *result = g_dbus_connection_call_sync(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        target_object_path,
+        "org.freedesktop.DBus.Properties",
+        "Set",
+        g_variant_new("(ssv)", interface_name, property_name, value),
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        error);
+    
+    if (result) {
+        g_variant_unref(result);
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+// Proxy a single object with all its interfaces
+static gboolean proxy_single_object(const char *object_path, GDBusNodeInfo *node_info)
+{
+    // Skip if no interfaces to proxy
+    if (!node_info->interfaces || !node_info->interfaces[0]) {
+        log_verbose("Object %s has no interfaces, skipping", object_path);
+        return TRUE;
+    }
+    
+    log_info("Proxying object: %s", object_path);
+    
+    // Create proxied object structure
+    ProxiedObject *proxied_obj = g_new0(ProxiedObject, 1);
+    proxied_obj->object_path = g_strdup(object_path);
+    proxied_obj->node_info = g_dbus_node_info_ref(node_info);
+    proxied_obj->registration_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    
+    GDBusInterfaceVTable vtable = {
+        .method_call = handle_method_call_generic,
+        .get_property = handle_get_property_generic,
+        .set_property = handle_set_property_generic,
+        .padding = {0}
+    };
+    
+    // List of standard D-Bus interfaces that GDBus provides automatically
+    const char *standard_interfaces[] = {
+        "org.freedesktop.DBus.Introspectable",
+        "org.freedesktop.DBus.Peer", 
+        "org.freedesktop.DBus.Properties",
+        NULL
+    };
+    
+    // Function to check if interface is standard
+    auto is_standard_interface = [](const char *interface_name, const char **standard_list) -> gboolean {
+        for (int i = 0; standard_list[i]; i++) {
+            if (g_strcmp0(interface_name, standard_list[i]) == 0) {
+                return TRUE;
+            }
+        }
+        return FALSE;
+    };
+    
+    int registered_count = 0;
+    
+    // Register each interface (except standard ones)
+    for (int i = 0; node_info->interfaces[i]; i++) {
+        GDBusInterfaceInfo *iface = node_info->interfaces[i];
+        GError *error = NULL;
+        
+        // Skip standard D-Bus interfaces - GDBus provides these automatically
+        if (is_standard_interface(iface->name, standard_interfaces)) {
+            log_verbose("Skipping standard interface: %s", iface->name);
+            continue;
+        }
+        
+        log_verbose("Registering interface %s on object %s", iface->name, object_path);
+        
+        guint registration_id = g_dbus_connection_register_object(
+            proxy_state->target_bus,
+            object_path,
+            iface,
+            &vtable,
+            g_strdup(object_path), // Pass object path as user_data for forwarding
+            g_free,
+            &error);
+        
+        if (registration_id == 0) {
+            log_error("Failed to register interface %s on %s: %s", 
+                     iface->name, object_path, error ? error->message : "Unknown error");
+            if (error) g_error_free(error);
+            continue; // Try other interfaces
+        }
+        
+        registered_count++;
+        
+        // Store registration ID
+        g_hash_table_insert(proxied_obj->registration_ids, 
+                           g_strdup(iface->name), 
+                           GUINT_TO_POINTER(registration_id));
+        
+        // Also add to global registry for cleanup
+        g_hash_table_insert(proxy_state->registered_objects,
+                           GUINT_TO_POINTER(registration_id),
+                           g_strdup_printf("%s:%s", object_path, iface->name));
+        
+        log_verbose("Interface %s registered on %s with ID %u", iface->name, object_path, registration_id);
+    }
+    
+    if (registered_count > 0) {
+        // Store the proxied object only if we registered something
+        g_hash_table_insert(proxy_state->proxied_objects, g_strdup(object_path), proxied_obj);
+        log_info("Successfully proxied object %s with %d interfaces", object_path, registered_count);
+    } else {
+        // No interfaces registered, clean up
+        log_verbose("No custom interfaces registered for %s", object_path);
+        free_proxied_object(proxied_obj);
+    }
+    
+    return TRUE;
+}
+
+#if 0 // jarekk
+// Update your signal forwarding to be less restrictive
+static void on_signal_received_catchall_updated(GDBusConnection *connection,
+                                               const char *sender_name,
+                                               const char *object_path,
+                                               const char *interface_name,
+                                               const char *signal_name,
+                                               GVariant *parameters,
+                                               gpointer user_data)
+{
+    // Only forward signals from our specific source
+    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
+        return;
+    }
+    
+    // Check if this object path is one we're proxying
+    if (!g_hash_table_contains(proxy_state->proxied_objects, object_path)) {
+        // Also check if it's a child of our root path (for dynamic objects)
+        if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
+            return;
+        }
+    }
+    
+    log_verbose("Signal received: %s.%s from %s at %s", 
+                interface_name, signal_name, sender_name, object_path);
+    
+    GError *error = NULL;
+    gboolean success = g_dbus_connection_emit_signal(
+        proxy_state->target_bus,
+        NULL,
+        object_path,
+        interface_name,
+        signal_name,
+        parameters,
+        &error);
+    
+    if (!success) {
+        log_error("Failed to forward signal: %s", error ? error->message : "Unknown error");
+        if (error) g_error_free(error);
+    } else {
+        log_verbose("Signal forwarded successfully");
+    }
 }
 
 // Forward method calls from target bus to source bus
@@ -184,6 +614,7 @@ static gboolean handle_set_property(GDBusConnection *connection G_GNUC_UNUSED,
     log_error("Property set failed: %s", error && *error ? (*error)->message : "Unknown error");
     return FALSE;
 }
+#endif
 
 // Forward signals from source bus to target bus - catch-all version
 static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
@@ -194,45 +625,47 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
                                         GVariant *parameters,
                                         gpointer user_data G_GNUC_UNUSED)
 {
-    // Only forward signals from our specific source
-    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
+    // Forward signals from our source service OR from the D-Bus daemon
+    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0 &&
+        g_strcmp0(sender_name, "org.freedesktop.DBus") != 0) {
         return;
     }
     
-    // Only forward signals from our specific object path (or child paths)
-    if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
-        return;
-    }
-    
-    log_verbose("Signal received (catch-all): %s.%s from %s at %s", 
-                interface_name, signal_name, sender_name, object_path);
-    
-    GError *error = NULL;
-    gboolean success = g_dbus_connection_emit_signal(
-        proxy_state->target_bus,
-        NULL, // Broadcast to all subscribers
-        object_path, // Use the original object path
-        interface_name,
-        signal_name,
-        parameters,
-        &error);
-    
-    if (success) {
-        log_verbose("Signal forwarded successfully");
-    } else {
-        log_error("Failed to forward signal: %s", error ? error->message : "Unknown error");
-        if (error) g_error_free(error);
+    // Check if this is a path we're proxying
+    if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
+        g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
+        g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
+        
+        log_verbose("Signal received: %s.%s from %s at %s", 
+                    interface_name, signal_name, sender_name, object_path);
+        
+        GError *error = NULL;
+        gboolean success = g_dbus_connection_emit_signal(
+            proxy_state->target_bus,
+            NULL,
+            object_path,
+            interface_name,
+            signal_name,
+            parameters,
+            &error);
+        
+        if (!success) {
+            log_error("Failed to forward signal: %s", error ? error->message : "Unknown error");
+            if (error) g_error_free(error);
+        } else {
+            log_verbose("Signal forwarded successfully");
+        }
     }
 }
 
 // Handle properties changed signals specially
-static void on_properties_changed(GDBusConnection *connection,
+static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
                                   const char *sender_name,
                                   const char *object_path,
                                   const char *interface_name,
                                   const char *signal_name,
                                   GVariant *parameters,
-                                  gpointer user_data)
+                                  G_GNUC_UNUSED gpointer user_data)
 {
     // Only forward signals from our specific source
     if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
@@ -276,7 +709,8 @@ static gboolean init_proxy_state(const ProxyConfig *config)
     proxy_state->registered_objects = g_hash_table_new(g_direct_hash, g_direct_equal);
     proxy_state->signal_subscriptions = g_hash_table_new(g_direct_hash, g_direct_equal);
     proxy_state->catch_all_subscription_id = 0;
-    
+    proxy_state->proxied_objects = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, free_proxied_object);
+
     return TRUE;
 }
 
@@ -408,53 +842,28 @@ static gboolean setup_signal_forwarding()
 // Register interfaces
 static gboolean setup_proxy_interfaces()
 {
-    if (!proxy_state->introspection_data->interfaces) {
-        log_error("No interfaces found in introspection data");
+    log_info("Setting up proxy interfaces - discovering full object tree");
+
+    // First, proxy the D-Bus daemon interface that clients use for service discovery
+    if (!discover_and_proxy_object_tree("/org/freedesktop")) {
+        log_error("Failed to discover and proxy D-Bus daemon interface");
+        return FALSE;
+    }
+
+    // Start recursive discovery from the root object
+    if (!discover_and_proxy_object_tree(proxy_state->config.source_object_path)) {
+        log_error("Failed to discover and proxy object tree");
         return FALSE;
     }
     
-    GDBusInterfaceVTable vtable = {
-        .method_call = handle_method_call,
-        .get_property = handle_get_property,
-        .set_property = handle_set_property,
-        .padding = {0}
-    };
-    
-    // Register each interface on the target bus
-    for (int i = 0; proxy_state->introspection_data->interfaces[i]; i++) {
-        GDBusInterfaceInfo *iface = proxy_state->introspection_data->interfaces[i];
-        GError *error = NULL;
-        
-        log_info("Registering interface: %s", iface->name);
-        
-        guint registration_id = g_dbus_connection_register_object(
-            proxy_state->target_bus,
-            proxy_state->config.source_object_path,
-            iface,
-            &vtable,
-            NULL,
-            NULL,
-            &error);
-        
-        if (registration_id == 0) {
-            log_error("Failed to register interface %s: %s", iface->name, error->message);
-            g_error_free(error);
-            return FALSE;
-        }
-        
-        g_hash_table_insert(proxy_state->registered_objects, 
-                           GUINT_TO_POINTER(registration_id), 
-                           g_strdup(iface->name));
-        
-        log_verbose("Interface %s registered with ID %u", iface->name, registration_id);
-    }
-    
-    // Set up signal forwarding (both catch-all and PropertiesChanged)
+    // Set up signal forwarding
     if (!setup_signal_forwarding()) {
         return FALSE;
     }
     
-    log_info("All interfaces registered and signal forwarding set up");
+    log_info("Object tree proxying complete - %u objects proxied", 
+             g_hash_table_size(proxy_state->proxied_objects));
+    
     return TRUE;
 }
 
@@ -529,6 +938,10 @@ static void cleanup_proxy_state()
             g_free(value);
         }
         g_hash_table_destroy(proxy_state->signal_subscriptions);
+    }
+
+    if (proxy_state->proxied_objects) {
+        g_hash_table_destroy(proxy_state->proxied_objects);
     }
     
     if (proxy_state->introspection_data) {
