@@ -283,7 +283,7 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
         },
         invocation);
 }
-
+#if 1
 // Generic property handlers that work for any object path  
 static GVariant *handle_get_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
                                             const char *sender,
@@ -320,6 +320,131 @@ static GVariant *handle_get_property_generic(G_GNUC_UNUSED GDBusConnection *conn
     
     return NULL;
 }
+#else
+
+// Generic callback for forwarding replies back to the target bus
+static void
+forward_call_cb(GObject *source_object,
+                GAsyncResult *res,
+                gpointer user_data)
+{
+    GDBusMethodInvocation *invocation = (GDBusMethodInvocation *) user_data;
+    GVariant *result = NULL;
+    GError *error = NULL;
+
+    result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source_object),
+                                           res,
+                                           &error);
+
+    if (error) {
+        g_dbus_method_invocation_return_gerror(invocation, error);
+        g_error_free(error);
+        return;
+    }
+
+    if (result) {
+        // If the remote method returned a tuple, unpack it automatically
+        if (g_variant_is_of_type(result, G_VARIANT_TYPE_TUPLE)) {
+            g_dbus_method_invocation_return_value(invocation, result);
+        } else {
+            // Wrap non-tuple in a tuple
+            g_dbus_method_invocation_return_value(invocation,
+                                                  g_variant_new_tuple(&result, 1));
+            g_variant_unref(result);
+        }
+    } else {
+        // No return value (e.g. Set)
+        g_dbus_method_invocation_return_value(invocation, NULL);
+    }
+}
+
+#if 0
+static GVariant *handle_get_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
+                                            const char *sender,
+                                            const char *object_path,
+                                            const char *interface_name,
+                                            const char *property_name,
+                                            GError **error,
+                                            gpointer user_data)
+#endif
+
+static GVariant *
+handle_get_property_generic(GDBusConnection *connection,
+                            const gchar *sender,
+                            const gchar *object_path,
+                            const gchar *interface_name,
+                            const gchar *method_name,
+                            GVariant *parameters,
+                            GDBusMethodInvocation *invocation,
+                            gpointer user_data)
+{
+    ProxyState *proxy_state = (ProxyState *)user_data;
+    const gchar *target_object_path = object_path;
+
+    if (g_strcmp0(method_name, "Get") == 0) {
+        const gchar *iface, *prop;
+        g_variant_get(parameters, "(&s&s)", &iface, &prop);
+
+        g_dbus_connection_call(
+            proxy_state->source_bus,
+            proxy_state->config.source_bus_name,
+            target_object_path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            g_variant_new("(ss)", iface, prop),
+            G_VARIANT_TYPE("(v)"),
+            G_DBUS_CALL_FLAGS_NONE,
+            -1,
+            NULL,
+            (GAsyncReadyCallback)forward_call_cb,
+            invocation);
+    }
+    else if (g_strcmp0(method_name, "Set") == 0) {
+        const gchar *iface, *prop;
+        GVariant *value;
+        g_variant_get(parameters, "(&s&s@v)", &iface, &prop, &value);
+
+        g_dbus_connection_call(
+            proxy_state->source_bus,
+            proxy_state->config.source_bus_name,
+            target_object_path,
+            "org.freedesktop.DBus.Properties",
+            "Set",
+            g_variant_new("(ssv)", iface, prop, value),
+            NULL,
+            G_DBUS_CALL_FLAGS_NONE,
+            -1,
+            NULL,
+            (GAsyncReadyCallback)forward_call_cb,
+            invocation);
+    }
+    else if (g_strcmp0(method_name, "GetAll") == 0) {
+        const gchar *iface;
+        g_variant_get(parameters, "(&s)", &iface);
+
+        g_dbus_connection_call(
+            proxy_state->source_bus,
+            proxy_state->config.source_bus_name,
+            target_object_path,
+            "org.freedesktop.DBus.Properties",
+            "GetAll",
+            g_variant_new("(s)", iface),
+            G_VARIANT_TYPE("(a{sv})"),
+            G_DBUS_CALL_FLAGS_NONE,
+            -1,
+            NULL,
+            (GAsyncReadyCallback)forward_call_cb,
+            invocation);
+    }
+    else {
+        g_dbus_method_invocation_return_error(invocation,
+                                              G_DBUS_ERROR,
+                                              G_DBUS_ERROR_UNKNOWN_METHOD,
+                                              "Unhandled method: %s",
+                                              method_name);
+    }
+}
+#endif
 
 static gboolean handle_set_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
                                            const char *sender,
@@ -616,6 +741,213 @@ static gboolean handle_set_property(GDBusConnection *connection G_GNUC_UNUSED,
 }
 #endif
 
+// Add this function to debug what signals nm-applet is expecting
+static void setup_signal_debugging()
+{
+    // Debug: Log ALL signals on the source bus for a few minutes
+    guint debug_subscription = g_dbus_connection_signal_subscribe(
+        proxy_state->source_bus,
+        NULL,  // Any sender
+        NULL,  // Any interface  
+        NULL,  // Any signal
+        NULL,  // Any path
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        [](GDBusConnection *connection G_GNUC_UNUSED,
+           const char *sender_name,
+           const char *object_path,
+           const char *interface_name, 
+           const char *signal_name,
+           GVariant *parameters,
+           gpointer user_data G_GNUC_UNUSED) {
+            
+            // Only log NetworkManager-related signals to avoid spam
+            if ((sender_name && g_str_has_prefix(sender_name, "org.freedesktop.NetworkManager")) ||
+                (object_path && g_str_has_prefix(object_path, "/org/freedesktop/NetworkManager")) ||
+                (interface_name && g_str_has_prefix(interface_name, "org.freedesktop.NetworkManager"))) {
+                
+                log_info("DEBUG - Signal: %s.%s from %s at %s", 
+                         interface_name ?: "null",
+                         signal_name ?: "null", 
+                         sender_name ?: "null",
+                         object_path ?: "null");
+                
+                // Log parameter types too
+                if (parameters) {
+                    char *params_str = g_variant_print(parameters, TRUE);
+                    log_verbose("  Parameters: %s", params_str);
+                    g_free(params_str);
+                }
+            }
+        },
+        NULL, NULL);
+        
+    if (debug_subscription) {
+        log_info("Signal debugging enabled for NetworkManager signals");
+        
+        // Auto-disable debug logging after 2 minutes to avoid spam
+        g_timeout_add(120000, [](gpointer data) -> gboolean {
+            guint sub_id = GPOINTER_TO_UINT(data);
+            if (proxy_state && proxy_state->source_bus) {
+                g_dbus_connection_signal_unsubscribe(proxy_state->source_bus, sub_id);
+                log_info("Signal debugging disabled");
+            }
+            return FALSE; // one-shot
+        }, GUINT_TO_POINTER(debug_subscription));
+    }
+}
+
+// Call this in setup_signal_forwarding() if you want to debug:
+// setup_signal_debugging();  // Add this line at the end of setup_signal_forwarding()
+
+
+
+// jarekk on_signal_received_catchall_fixed 
+static void on_signal_received_catchall_fixed(GDBusConnection *connection G_GNUC_UNUSED,
+                                              const char *sender_name,
+                                              const char *object_path,
+                                              const char *interface_name,
+                                              const char *signal_name,
+                                              GVariant *parameters,
+                                              gpointer user_data G_GNUC_UNUSED)
+{
+    // Critical signals that nm-applet needs - be more permissive
+    gboolean should_forward = FALSE;
+    
+    // 1. Signals from our main NetworkManager service
+    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) == 0) {
+        should_forward = TRUE;
+    }
+    
+    // 2. D-Bus daemon signals (service appearing/disappearing)
+    else if (g_strcmp0(sender_name, "org.freedesktop.DBus") == 0) {
+        should_forward = TRUE;
+    }
+    
+    // 3. NetworkManager-related signals from ANY sender (important!)
+    else if (g_str_has_prefix(object_path ?: "", "/org/freedesktop/NetworkManager")) {
+        should_forward = TRUE;
+        log_verbose("Forwarding NM object signal from %s", sender_name ?: "unknown");
+    }
+    
+    // 4. NetworkManager interface signals regardless of sender
+    else if (g_str_has_prefix(interface_name ?: "", "org.freedesktop.NetworkManager")) {
+        should_forward = TRUE;
+        log_verbose("Forwarding NM interface signal from %s", sender_name ?: "unknown");
+    }
+    
+    // 5. StatusNotifier/SystemTray related signals (for icon display)
+    else if (g_str_has_prefix(interface_name ?: "", "org.kde.StatusNotifierItem") ||
+             g_str_has_prefix(interface_name ?: "", "org.freedesktop.StatusNotifierItem") ||
+             g_strcmp0(interface_name, "org.gtk.Application") == 0) {
+        should_forward = TRUE;
+        log_verbose("Forwarding status/tray signal from %s", sender_name ?: "unknown");
+    }
+    
+    if (!should_forward) {
+        return;
+    }
+    
+    log_verbose("Signal received: %s.%s from %s at %s", 
+                interface_name ?: "unknown", signal_name ?: "unknown", 
+                sender_name ?: "unknown", object_path ?: "unknown");
+    
+    GError *error = NULL;
+    gboolean success = g_dbus_connection_emit_signal(
+        proxy_state->target_bus,
+        NULL,
+        object_path,
+        interface_name,
+        signal_name,
+        parameters,
+        &error);
+    
+    if (!success) {
+        log_error("Failed to forward signal %s.%s: %s", 
+                  interface_name ?: "unknown", signal_name ?: "unknown",
+                  error ? error->message : "Unknown error");
+        if (error) g_error_free(error);
+    } else {
+        log_verbose("Signal forwarded successfully");
+    }
+}
+
+// Add specific NetworkManager state monitoring
+static void setup_nm_state_monitoring()
+{
+    // Monitor NetworkManager state changes specifically
+    guint nm_state_subscription = g_dbus_connection_signal_subscribe(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        "org.freedesktop.NetworkManager",
+        "StateChanged",
+        "/org/freedesktop/NetworkManager",
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        [](GDBusConnection *connection G_GNUC_UNUSED,
+           const char *sender_name,
+           const char *object_path,
+           const char *interface_name,
+           const char *signal_name,
+           GVariant *parameters,
+           gpointer user_data G_GNUC_UNUSED) {
+            
+            log_info("NetworkManager StateChanged signal received");
+            
+            // Extract state value for logging
+            if (parameters) {
+                guint32 state;
+                if (g_variant_is_of_type(parameters, G_VARIANT_TYPE("(u)"))) {
+                    g_variant_get(parameters, "(u)", &state);
+                    log_info("NetworkManager state: %u", state);
+                }
+            }
+            
+            GError *error = NULL;
+            g_dbus_connection_emit_signal(
+                proxy_state->target_bus,
+                NULL,
+                object_path,
+                interface_name,
+                signal_name,
+                parameters,
+                &error);
+                
+            if (error) {
+                log_error("Failed to forward StateChanged: %s", error->message);
+                g_error_free(error);
+            } else {
+                log_info("StateChanged signal forwarded");
+            }
+        },
+        NULL, NULL);
+    
+    if (nm_state_subscription) {
+        g_hash_table_insert(proxy_state->signal_subscriptions,
+                           GUINT_TO_POINTER(nm_state_subscription),
+                           g_strdup("NetworkManager.StateChanged"));
+    }
+    
+    // Monitor device state changes
+    guint device_state_subscription = g_dbus_connection_signal_subscribe(
+        proxy_state->source_bus,
+        proxy_state->config.source_bus_name,
+        "org.freedesktop.NetworkManager.Device",
+        "StateChanged",
+        NULL, // Any device path
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        on_signal_received_catchall_fixed, // Use the fixed handler
+        NULL, NULL);
+    
+    if (device_state_subscription) {
+        g_hash_table_insert(proxy_state->signal_subscriptions,
+                           GUINT_TO_POINTER(device_state_subscription),
+                           g_strdup("Device.StateChanged"));
+    }
+}
+
+#if 0 // jarekk
 // Forward signals from source bus to target bus - catch-all version
 static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
                                         const char *sender_name,
@@ -657,6 +989,7 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
         }
     }
 }
+#endif
 
 // Handle properties changed signals specially
 static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
@@ -791,18 +1124,18 @@ static gboolean fetch_introspection_data()
 // Setup signal forwarding with both catch-all and specific PropertiesChanged handling
 static gboolean setup_signal_forwarding()
 {
-    log_info("Setting up signal forwarding");
+    log_info("Setting up comprehensive signal forwarding");
     
-    // Subscribe to ALL signals from the source bus name
+    // Use the FIXED catch-all signal handler
     proxy_state->catch_all_subscription_id = g_dbus_connection_signal_subscribe(
         proxy_state->source_bus,
-        proxy_state->config.source_bus_name, // sender (our source service)
+        NULL,                                // sender (catch ALL senders now!)
         NULL,                                // interface_name (all interfaces)
         NULL,                                // member (all signals)
         NULL,                                // object_path (all paths - we filter in callback)
         NULL,                                // arg0 (no filtering)
         G_DBUS_SIGNAL_FLAGS_NONE,
-        on_signal_received_catchall,
+        on_signal_received_catchall_fixed,   // Use the FIXED version
         NULL,
         NULL);
     
@@ -811,31 +1144,65 @@ static gboolean setup_signal_forwarding()
         return FALSE;
     }
     
-    log_info("Catch-all signal subscription established (ID: %u)", proxy_state->catch_all_subscription_id);
+    log_info("Comprehensive signal subscription established (ID: %u)", 
+             proxy_state->catch_all_subscription_id);
     
-    // Also subscribe specifically to PropertiesChanged signals for better handling
+    // Add NetworkManager-specific monitoring
+    setup_nm_state_monitoring();
+    
+    // Keep the existing PropertiesChanged subscription but make it broader
     guint props_subscription_id = g_dbus_connection_signal_subscribe(
         proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
+        NULL,  // ANY sender (not just our source service)
         "org.freedesktop.DBus.Properties",
         "PropertiesChanged",
-        NULL, // All object paths (we filter in callback)
+        NULL, // All object paths
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
-        on_properties_changed,
-        NULL,
-        NULL);
+        [](GDBusConnection *connection G_GNUC_UNUSED,
+           const char *sender_name,
+           const char *object_path,
+           const char *interface_name,
+           const char *signal_name,
+           GVariant *parameters,
+           gpointer user_data G_GNUC_UNUSED) {
+            
+            // Forward PropertiesChanged from NetworkManager paths or interfaces
+            if ((object_path && g_str_has_prefix(object_path, "/org/freedesktop/NetworkManager")) ||
+                (sender_name && g_str_has_prefix(sender_name, "org.freedesktop.NetworkManager"))) {
+                
+                log_verbose("Forwarding PropertiesChanged from %s at %s", sender_name, object_path);
+                
+                GError *error = NULL;
+                g_dbus_connection_emit_signal(
+                    proxy_state->target_bus,
+                    NULL,
+                    object_path,
+                    interface_name,
+                    signal_name,
+                    parameters,
+                    &error);
+                    
+                if (error) {
+                    log_error("Failed to forward PropertiesChanged: %s", error->message);
+                    g_error_free(error);
+                }
+            }
+        },
+        NULL, NULL);
     
     if (props_subscription_id == 0) {
         log_error("Failed to set up PropertiesChanged signal subscription");
         return FALSE;
     }
-    
+
+    setup_signal_debugging();
+
     g_hash_table_insert(proxy_state->signal_subscriptions,
                        GUINT_TO_POINTER(props_subscription_id),
-                       g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
+                       g_strdup("Enhanced.PropertiesChanged"));
     
-    log_info("PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
+    log_info("Enhanced PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
     return TRUE;
 }
 
@@ -844,18 +1211,26 @@ static gboolean setup_proxy_interfaces()
 {
     log_info("Setting up proxy interfaces - discovering full object tree");
 
+#if 1 // wrong approach    
     // First, proxy the D-Bus daemon interface that clients use for service discovery
     if (!discover_and_proxy_object_tree("/org/freedesktop")) {
         log_error("Failed to discover and proxy D-Bus daemon interface");
         return FALSE;
     }
+#endif
 
     // Start recursive discovery from the root object
     if (!discover_and_proxy_object_tree(proxy_state->config.source_object_path)) {
         log_error("Failed to discover and proxy object tree");
         return FALSE;
     }
-    
+    // jarekk is it needed?
+    // // Also proxy the StatusNotifierItem so Cosmic sees nm-applet’s icon
+    // if (!discover_and_proxy_object_tree("/StatusNotifierItem");)) {
+    //     log_error("Failed to discover and proxy /StatusNotifierItem tree");
+    //     return FALSE;
+    // }
+
     // Set up signal forwarding
     if (!setup_signal_forwarding()) {
         return FALSE;
@@ -891,11 +1266,41 @@ static void on_bus_acquired_for_owner(GDBusConnection *connection,
     }
 }
 
+static void emit_names_changed_signal()
+{
+    // Emit NameOwnerChanged signal to announce our service
+    GError *error = NULL;
+    gboolean success = g_dbus_connection_emit_signal(
+        proxy_state->target_bus,
+        NULL,  // broadcast to all
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameOwnerChanged",
+        g_variant_new("(sss)", 
+                     proxy_state->config.proxy_bus_name,  // service name
+                     "",  // old owner (empty = new service)
+                     g_dbus_connection_get_unique_name(proxy_state->target_bus)), // new owner
+        &error);
+    
+    if (!success) {
+        log_error("Failed to emit NameOwnerChanged: %s", error ? error->message : "Unknown");
+        if (error) g_error_free(error);
+    } else {
+        log_info("Emitted NameOwnerChanged signal for service announcement");
+    }
+}
+
 static void on_name_acquired_log(G_GNUC_UNUSED GDBusConnection *conn,
                                  const gchar *name,
                                  gpointer user_data G_GNUC_UNUSED)
 {
     log_info("Name successfully acquired: %s", name);
+    
+    // Give a small delay for all interfaces to be registered
+    g_timeout_add(500, [](gpointer data) -> gboolean {
+        emit_names_changed_signal();
+        return FALSE; // one-shot timer
+    }, NULL);
 }
 
 static void on_name_lost_log(G_GNUC_UNUSED GDBusConnection *conn,
