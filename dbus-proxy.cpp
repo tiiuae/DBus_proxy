@@ -1147,12 +1147,14 @@ on_filter (GDBusConnection *connection G_GNUC_UNUSED,
            gboolean         incoming G_GNUC_UNUSED,
            gpointer         user_data G_GNUC_UNUSED)
 {
+    log_info("onfilter !!!\n");
     if (g_dbus_message_get_message_type(message) == G_DBUS_MESSAGE_TYPE_METHOD_CALL) {
         const gchar *iface = g_dbus_message_get_interface(message);
         const gchar *member = g_dbus_message_get_member(message);
         const gchar *path = g_dbus_message_get_path(message);
         const gchar *dest = g_dbus_message_get_destination(message);
 
+        log_info("onfilter member=%s path=%s dest=%s\n", member ? member : "null", path ? path : "null", dest ? dest : "null");
         if (iface && g_strcmp0(iface, "org.freedesktop.DBus") == 0 &&
             member && g_strcmp0(member, "AddMatch") == 0 &&
             path && g_strcmp0(path, "/org/freedesktop/DBus") == 0 &&
