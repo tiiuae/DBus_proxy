@@ -824,6 +824,7 @@ static void on_signal_received_catchall_fixed(GDBusConnection *connection G_GNUC
         should_forward = TRUE;
     }
     
+    // jarekk fix hardcoded NetworkManager
     // 3. NetworkManager-related signals from ANY sender (important!)
     else if (g_str_has_prefix(object_path ?: "", "/org/freedesktop/NetworkManager")) {
         should_forward = TRUE;
@@ -885,7 +886,7 @@ static void setup_nm_state_monitoring()
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
         [](GDBusConnection *connection G_GNUC_UNUSED,
-           const char *sender_name,
+           const char *sender_name G_GNUC_UNUSED,
            const char *object_path,
            const char *interface_name,
            const char *signal_name,
@@ -1121,6 +1122,30 @@ static gboolean fetch_introspection_data()
     return TRUE;
 }
 
+static void emit_names_changed_signal()
+{
+    // Emit NameOwnerChanged signal to announce our service
+    GError *error = NULL;
+    gboolean success = g_dbus_connection_emit_signal(
+        proxy_state->target_bus,
+        NULL,  // broadcast to all
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameOwnerChanged",
+        g_variant_new("(sss)", 
+                     proxy_state->config.proxy_bus_name,  // service name
+                     "",  // old owner (empty = new service)
+                     g_dbus_connection_get_unique_name(proxy_state->target_bus)), // new owner
+        &error);
+    
+    if (!success) {
+        log_error("Failed to emit NameOwnerChanged: %s", error ? error->message : "Unknown");
+        if (error) g_error_free(error);
+    } else {
+        log_info("Emitted NameOwnerChanged signal for service announcement");
+    }
+}
+
 // Setup signal forwarding with both catch-all and specific PropertiesChanged handling
 static gboolean setup_signal_forwarding()
 {
@@ -1196,6 +1221,44 @@ static gboolean setup_signal_forwarding()
         return FALSE;
     }
 
+    // Signal to new clients appearing on the bus
+    guint client_monitor = g_dbus_connection_signal_subscribe(
+        proxy_state->target_bus,  // Monitor target bus
+        "org.freedesktop.DBus",
+        "org.freedesktop.DBus", 
+        "NameOwnerChanged",
+        "/org/freedesktop/DBus",
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        [](GDBusConnection *connection G_GNUC_UNUSED,
+        const char *sender_name G_GNUC_UNUSED,
+        const char *object_path G_GNUC_UNUSED, 
+        const char *interface_name G_GNUC_UNUSED,
+        const char *signal_name G_GNUC_UNUSED,
+        GVariant *parameters,
+        gpointer user_data G_GNUC_UNUSED) {
+            
+            const char *service_name, *old_owner, *new_owner;
+            g_variant_get(parameters, "(&s&s&s)", &service_name, &old_owner, &new_owner);
+            
+            // Detect when a new client appears (like nm-applet)
+            if (strlen(new_owner) > 0 && strlen(old_owner) == 0) {
+                log_info("New client connected: %s (owner: %s)", service_name, new_owner);
+                
+                // If NetworkManager proxy is already running, send state sync
+                if (proxy_state && proxy_state->target_bus) {
+                    // Send synthetic NameOwnerChanged for our service
+                    emit_names_changed_signal();
+                }
+            }
+        },
+        NULL, NULL);
+
+    if (client_monitor == 0) {
+        log_error("Failed to set up NameOwnerChanged signal subscription");
+        return FALSE;
+    }
+
     setup_signal_debugging();
 
     g_hash_table_insert(proxy_state->signal_subscriptions,
@@ -1203,6 +1266,13 @@ static gboolean setup_signal_forwarding()
                        g_strdup("Enhanced.PropertiesChanged"));
     
     log_info("Enhanced PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
+    return TRUE;
+
+    g_hash_table_insert(proxy_state->signal_subscriptions,
+                       GUINT_TO_POINTER(client_monitor),
+                       g_strdup("NameOwnerChanged"));
+    
+    log_info("NameOwnerChanged signal subscription established (ID: %u)", props_subscription_id);
     return TRUE;
 }
 
@@ -1266,30 +1336,6 @@ static void on_bus_acquired_for_owner(GDBusConnection *connection,
     }
 }
 
-static void emit_names_changed_signal()
-{
-    // Emit NameOwnerChanged signal to announce our service
-    GError *error = NULL;
-    gboolean success = g_dbus_connection_emit_signal(
-        proxy_state->target_bus,
-        NULL,  // broadcast to all
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-        "NameOwnerChanged",
-        g_variant_new("(sss)", 
-                     proxy_state->config.proxy_bus_name,  // service name
-                     "",  // old owner (empty = new service)
-                     g_dbus_connection_get_unique_name(proxy_state->target_bus)), // new owner
-        &error);
-    
-    if (!success) {
-        log_error("Failed to emit NameOwnerChanged: %s", error ? error->message : "Unknown");
-        if (error) g_error_free(error);
-    } else {
-        log_info("Emitted NameOwnerChanged signal for service announcement");
-    }
-}
-
 static void on_name_acquired_log(G_GNUC_UNUSED GDBusConnection *conn,
                                  const gchar *name,
                                  gpointer user_data G_GNUC_UNUSED)
@@ -1297,7 +1343,7 @@ static void on_name_acquired_log(G_GNUC_UNUSED GDBusConnection *conn,
     log_info("Name successfully acquired: %s", name);
     
     // Give a small delay for all interfaces to be registered
-    g_timeout_add(500, [](gpointer data) -> gboolean {
+    g_timeout_add(500, [](gpointer data G_GNUC_UNUSED) -> gboolean {
         emit_names_changed_signal();
         return FALSE; // one-shot timer
     }, NULL);
