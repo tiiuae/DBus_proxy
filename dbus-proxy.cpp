@@ -800,9 +800,6 @@ static void setup_signal_debugging()
 // Call this in setup_signal_forwarding() if you want to debug:
 // setup_signal_debugging();  // Add this line at the end of setup_signal_forwarding()
 
-
-
-// jarekk on_signal_received_catchall_fixed 
 static void on_signal_received_catchall_fixed(GDBusConnection *connection G_GNUC_UNUSED,
                                               const char *sender_name,
                                               const char *object_path,
@@ -836,13 +833,11 @@ static void on_signal_received_catchall_fixed(GDBusConnection *connection G_GNUC
         should_forward = TRUE;
         log_verbose("Forwarding NM interface signal from %s", sender_name ?: "unknown");
     }
-    
-    // 5. StatusNotifier/SystemTray related signals (for icon display)
-    else if (g_str_has_prefix(interface_name ?: "", "org.kde.StatusNotifierItem") ||
-             g_str_has_prefix(interface_name ?: "", "org.freedesktop.StatusNotifierItem") ||
-             g_strcmp0(interface_name, "org.gtk.Application") == 0) {
+    // 5. D-Bus daemon interface signals regardless of sender (e.g. NameOwnerChanged)
+    // jarekk doesn't happen. What for?
+    else if (g_str_has_prefix(interface_name ?: "", "org.freedesktop.DBus")) {
         should_forward = TRUE;
-        log_verbose("Forwarding status/tray signal from %s", sender_name ?: "unknown");
+        log_verbose("Forwarding D-Bus interface signal from %s!!!", sender_name ?: "unknown");
     }
     
     if (!should_forward) {
@@ -1146,6 +1141,37 @@ static void emit_names_changed_signal()
     }
 }
 
+static GDBusMessage *
+on_filter (GDBusConnection *connection G_GNUC_UNUSED,
+           GDBusMessage    *message,
+           gboolean         incoming G_GNUC_UNUSED,
+           gpointer         user_data G_GNUC_UNUSED)
+{
+    if (g_dbus_message_get_message_type(message) == G_DBUS_MESSAGE_TYPE_METHOD_CALL) {
+        const gchar *iface = g_dbus_message_get_interface(message);
+        const gchar *member = g_dbus_message_get_member(message);
+        const gchar *path = g_dbus_message_get_path(message);
+        const gchar *dest = g_dbus_message_get_destination(message);
+
+        if (iface && g_strcmp0(iface, "org.freedesktop.DBus") == 0 &&
+            member && g_strcmp0(member, "AddMatch") == 0 &&
+            path && g_strcmp0(path, "/org/freedesktop/DBus") == 0 &&
+            dest && g_strcmp0(dest, "org.freedesktop.DBus") == 0) {
+
+            GVariant *body = g_dbus_message_get_body(message);
+            if (body) {
+                gchar *match_rule = NULL;
+                g_variant_get(body, "(&s)", &match_rule);
+                log_info("Caught AddMatch call: %s\n", match_rule);
+            } else {
+                log_info("Caught AddMatch call (no body)\n");
+            }
+        }
+    }
+
+    return message;
+}
+
 // Setup signal forwarding with both catch-all and specific PropertiesChanged handling
 static gboolean setup_signal_forwarding()
 {
@@ -1168,12 +1194,17 @@ static gboolean setup_signal_forwarding()
         log_error("Failed to set up catch-all signal subscription");
         return FALSE;
     }
-    
-    log_info("Comprehensive signal subscription established (ID: %u)", 
+
+    log_info("Comprehensive signal subscription established on source bus (ID: %u)", 
              proxy_state->catch_all_subscription_id);
     
     // Add NetworkManager-specific monitoring
     setup_nm_state_monitoring();
+
+     // Install filter to see all messages we are allowed to see
+    g_dbus_connection_add_filter(proxy_state->target_bus,
+                                 (GDBusMessageFilterFunction)on_filter,
+                                 NULL, NULL);
     
     // Keep the existing PropertiesChanged subscription but make it broader
     guint props_subscription_id = g_dbus_connection_signal_subscribe(
@@ -1221,13 +1252,13 @@ static gboolean setup_signal_forwarding()
         return FALSE;
     }
 
-    // Signal to new clients appearing on the bus
+    // Signal to new clients appearing on the bus jarekk: doesn't work
     guint client_monitor = g_dbus_connection_signal_subscribe(
         proxy_state->target_bus,  // Monitor target bus
-        "org.freedesktop.DBus",
-        "org.freedesktop.DBus", 
-        "NameOwnerChanged",
-        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", // Sender
+        "org.freedesktop.DBus", // Interface
+        "NameOwnerChanged", // Signal
+        "/org/freedesktop/DBus", // Object path
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
         [](GDBusConnection *connection G_GNUC_UNUSED,
