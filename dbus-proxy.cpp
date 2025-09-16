@@ -1207,6 +1207,17 @@ static gboolean setup_signal_forwarding()
     g_dbus_connection_add_filter(proxy_state->target_bus,
                                  (GDBusMessageFilterFunction)on_filter,
                                  NULL, NULL);
+    g_dbus_connection_call_sync(proxy_state->target_bus,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "AddMatch",
+            g_variant_new("(s)", "type='method_call',destination='org.freedesktop.DBus'"),
+            NULL,
+            G_DBUS_CALL_FLAGS_NONE,
+            -1,
+            NULL,
+            NULL);
     
     // Keep the existing PropertiesChanged subscription but make it broader
     guint props_subscription_id = g_dbus_connection_signal_subscribe(
