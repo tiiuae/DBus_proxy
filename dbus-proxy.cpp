@@ -464,37 +464,36 @@ static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
                                   GVariant *parameters,
                                   G_GNUC_UNUSED gpointer user_data)
 {
-    // Only forward signals from our specific source
-    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
-        return;
-    }
-    
     // Only forward signals from our specific object path (or child paths)
-    if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
-        return;
-    }
+
+    if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
+        g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
+    // if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
+    //     return;
+    // }
     
-    const char *changed_interface;
-    g_variant_get_child(parameters, 0, "&s", &changed_interface);
-    
-    log_verbose("Properties changed signal for interface: %s at %s", changed_interface, object_path);
-    
-    // Forward the PropertiesChanged signal
-    GError *error = NULL;
-    gboolean success = g_dbus_connection_emit_signal(
-        proxy_state->target_bus,
-        NULL, // Broadcast to all subscribers
-        object_path, // Use the original object path
-        interface_name,
-        signal_name,
-        parameters,
-        &error);
-    
-    if (success) {
-        log_verbose("PropertiesChanged signal forwarded successfully");
+        log_verbose("Properties changed signal for interface: %s at %s", changed_interface, object_path);
+
+        const char *changed_interface;
+        g_variant_get_child(parameters, 0, "&s", &changed_interface);
+            
+        // Forward the PropertiesChanged signal
+        GError *error = NULL;
+        gboolean success = g_dbus_connection_emit_signal(
+            proxy_state->target_bus,
+            NULL, // Broadcast to all subscribers
+            object_path, // Use the original object path
+            interface_name,
+            signal_name,
+            parameters,
+            &error);
+        
+        if (!success) {
+            log_error("Failed to forward PropertiesChanged signal: %s", error ? error->message : "Unknown error");
+            if (error) g_error_free(error);
+        }
     } else {
-        log_error("Failed to forward PropertiesChanged signal: %s", error ? error->message : "Unknown error");
-        if (error) g_error_free(error);
+        log_error("PropertiesChanged signal from %s at %s ignored (not proxied)", sender_name, object_path);
     }
 }
 
@@ -619,7 +618,7 @@ static gboolean setup_signal_forwarding()
         NULL, // All object paths (we filter in callback)
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
-        on_properties_changed,
+        on_signal_received_catchall,
         NULL,
         NULL);
     
