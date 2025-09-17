@@ -428,12 +428,6 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
                                         GVariant *parameters,
                                         gpointer user_data G_GNUC_UNUSED)
 {
-    // Forward signals from our source service OR from the D-Bus daemon
-    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0 &&
-        g_strcmp0(sender_name, "org.freedesktop.DBus") != 0) {
-        return;
-    }
-    
     // Check if this is a path we're proxying
     if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
         g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
@@ -455,9 +449,9 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
         if (!success) {
             log_error("Failed to forward signal: %s", error ? error->message : "Unknown error");
             if (error) g_error_free(error);
-        } else {
-            log_verbose("Signal forwarded successfully");
         }
+    } else {
+        log_error("Signal %s.%s from %s at %s ignored (not proxied)", interface_name, signal_name, sender_name, object_path);
     }
 }
 
