@@ -213,47 +213,6 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
     
     log_verbose("Method call: %s.%s on %s from %s (forwarding to %s)", 
                 interface_name, method_name, object_path, sender, target_object_path);
-    #if 0
-    // jarekk: Handle D-Bus daemon method calls.
-    // Maybe it's better to handle all requests to /org/freedesktop/DBus in a normal way?
-    // The code below is redundant with setup_proxy_interfaces()...
-
-    // Special case: Route D-Bus daemon calls to the D-Bus daemon on source bus
-    if (g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
-        log_verbose(">>>>>> D-Bus daemon method call: %s.%s from %s (routing to source bus D-Bus daemon)", 
-                    interface_name, method_name, sender);
-        
-        // jarekk
-        g_print(">>>> Routing D-Bus daemon call %s.%s to source bus\n", interface_name, method_name);
-        g_dbus_connection_call(
-            proxy_state->source_bus,
-            "org.freedesktop.DBus",          // D-Bus daemon service name
-            "/org/freedesktop/DBus",         // D-Bus daemon object path  
-            interface_name,
-            method_name,
-            parameters,
-            NULL,
-            G_DBUS_CALL_FLAGS_NONE,
-            -1,
-            NULL,
-            (GAsyncReadyCallback)[](GObject *source, GAsyncResult *res, gpointer user_data) {
-                GDBusMethodInvocation *inv = (GDBusMethodInvocation *)user_data;
-                GError *error = NULL;
-                GVariant *result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
-                
-                if (result) {
-                    log_verbose("D-Bus daemon method call successful");
-                    g_dbus_method_invocation_return_value(inv, result);
-                } else {
-                    log_error("D-Bus daemon method call failed: %s", error ? error->message : "Unknown error");
-                    g_dbus_method_invocation_return_gerror(inv, error);
-                    if (error) g_error_free(error);
-                }
-            },
-            invocation);
-        return;
-    }
-    #endif
 
     // Forward the call to the source bus using the original object path
     g_dbus_connection_call(
@@ -315,9 +274,11 @@ static GVariant *handle_get_property_generic(G_GNUC_UNUSED GDBusConnection *conn
         GVariant *value;
         g_variant_get(result, "(v)", &value);
         g_variant_unref(result);
+        log_verbose("Property get successful");
         return value;
     }
-    
+
+    log_error("Property get failed: %s", error && *error ? (*error)->message : "Unknown error");
     return NULL;
 }
 
@@ -352,7 +313,8 @@ static gboolean handle_set_property_generic(G_GNUC_UNUSED GDBusConnection *conne
         g_variant_unref(result);
         return TRUE;
     }
-    
+
+    log_error("Property set failed: %s", error && *error ? (*error)->message : "Unknown error");
     return FALSE;
 }
 
@@ -456,165 +418,6 @@ static gboolean proxy_single_object(const char *object_path, GDBusNodeInfo *node
     
     return TRUE;
 }
-
-#if 0 // jarekk
-// Update your signal forwarding to be less restrictive
-static void on_signal_received_catchall_updated(GDBusConnection *connection,
-                                               const char *sender_name,
-                                               const char *object_path,
-                                               const char *interface_name,
-                                               const char *signal_name,
-                                               GVariant *parameters,
-                                               gpointer user_data)
-{
-    // Only forward signals from our specific source
-    if (g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) {
-        return;
-    }
-    
-    // Check if this object path is one we're proxying
-    if (!g_hash_table_contains(proxy_state->proxied_objects, object_path)) {
-        // Also check if it's a child of our root path (for dynamic objects)
-        if (!g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
-            return;
-        }
-    }
-    
-    log_verbose("Signal received: %s.%s from %s at %s", 
-                interface_name, signal_name, sender_name, object_path);
-    
-    GError *error = NULL;
-    gboolean success = g_dbus_connection_emit_signal(
-        proxy_state->target_bus,
-        NULL,
-        object_path,
-        interface_name,
-        signal_name,
-        parameters,
-        &error);
-    
-    if (!success) {
-        log_error("Failed to forward signal: %s", error ? error->message : "Unknown error");
-        if (error) g_error_free(error);
-    } else {
-        log_verbose("Signal forwarded successfully");
-    }
-}
-
-// Forward method calls from target bus to source bus
-static void handle_method_call(GDBusConnection *connection G_GNUC_UNUSED,
-                               const char *sender,
-                               const char *object_path,
-                               const char *interface_name,
-                               const char *method_name,
-                               GVariant *parameters,
-                               GDBusMethodInvocation *invocation,
-                               gpointer user_data G_GNUC_UNUSED)
-{
-    log_verbose("Method call: %s.%s from %s object_path=%s", interface_name, method_name, sender, object_path);
-    
-    // Forward the call to the source bus
-    g_dbus_connection_call(
-        proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
-        proxy_state->config.source_object_path,
-        interface_name,
-        method_name,
-        parameters,
-        NULL, // Expected reply type (auto-detect)
-        G_DBUS_CALL_FLAGS_NONE,
-        -1, // Default timeout
-        NULL, // Cancellable
-        (GAsyncReadyCallback)[](GObject *source, GAsyncResult *res, gpointer user_data) {
-            GDBusMethodInvocation *inv = (GDBusMethodInvocation *)user_data;
-            GError *error = NULL;
-            GVariant *result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
-            
-            if (result) {
-                log_verbose("Method call successful, returning result");
-                g_dbus_method_invocation_return_value(inv, result);
-            } else {
-                log_error("Method call failed: %s", error ? error->message : "Unknown error");
-                g_dbus_method_invocation_return_gerror(inv, error);
-                if (error) g_error_free(error);
-            }
-        },
-        invocation);
-}
-
-// Handle property get requests
-static GVariant *handle_get_property(GDBusConnection *connection G_GNUC_UNUSED,
-                                     const char *sender,
-                                     const char *object_path G_GNUC_UNUSED,
-                                     const char *interface_name,
-                                     const char *property_name,
-                                     GError **error,
-                                     gpointer user_data G_GNUC_UNUSED)
-{
-    log_verbose("Property get: %s.%s from %s", interface_name, property_name, sender);
-    
-    // Synchronously get property from source bus
-    GVariant *result = g_dbus_connection_call_sync(
-        proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
-        proxy_state->config.source_object_path,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        g_variant_new("(ss)", interface_name, property_name),
-        G_VARIANT_TYPE("(v)"),
-        G_DBUS_CALL_FLAGS_NONE,
-        -1,
-        NULL,
-        error);
-    
-    if (result) {
-        GVariant *value;
-        g_variant_get(result, "(v)", &value);
-        g_variant_unref(result);
-        log_verbose("Property get successful");
-        return value;
-    }
-    
-    log_error("Property get failed: %s", error && *error ? (*error)->message : "Unknown error");
-    return NULL;
-}
-
-// Handle property set requests
-static gboolean handle_set_property(GDBusConnection *connection G_GNUC_UNUSED,
-                                    const char *sender,
-                                    const char *object_path G_GNUC_UNUSED,
-                                    const char *interface_name,
-                                    const char *property_name,
-                                    GVariant *value,
-                                    GError **error,
-                                    gpointer user_data G_GNUC_UNUSED)
-{
-    log_verbose("Property set: %s.%s from %s", interface_name, property_name, sender);
-    
-    // Forward property set to source bus
-    GVariant *result = g_dbus_connection_call_sync(
-        proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
-        proxy_state->config.source_object_path,
-        "org.freedesktop.DBus.Properties",
-        "Set",
-        g_variant_new("(ssv)", interface_name, property_name, value),
-        NULL,
-        G_DBUS_CALL_FLAGS_NONE,
-        -1,
-        NULL,
-        error);
-    
-    if (result) {
-        g_variant_unref(result);
-        log_verbose("Property set successful");
-        return TRUE;
-    }
-    
-    log_error("Property set failed: %s", error && *error ? (*error)->message : "Unknown error");
-    return FALSE;
-}
-#endif
 
 // Forward signals from source bus to target bus - catch-all version
 static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
