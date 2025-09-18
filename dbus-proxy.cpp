@@ -214,6 +214,9 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
     log_verbose("Method call: %s.%s on %s from %s (forwarding to %s)", 
                 interface_name, method_name, object_path, sender, target_object_path);
 
+    // Take a reference to ensure invocation stays alive
+    g_object_ref(invocation);
+
     // Forward the call to the source bus using the original object path
     g_dbus_connection_call(
         proxy_state->source_bus,
@@ -239,6 +242,8 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
                 g_dbus_method_invocation_return_gerror(inv, error);
                 if (error) g_error_free(error);
             }
+            // Release our reference
+            g_object_unref(inv);
         },
         invocation);
 }
@@ -347,6 +352,7 @@ static gboolean proxy_single_object(const char *object_path, GDBusNodeInfo *node
         "org.freedesktop.DBus.Introspectable",
         "org.freedesktop.DBus.Peer", 
         "org.freedesktop.DBus.Properties",
+        "org.freedesktop.DBus.ObjectManager",
         NULL
     };
     
@@ -575,6 +581,11 @@ static gboolean setup_proxy_interfaces()
 {
     log_info("Setting up proxy interfaces - discovering full object tree");
 
+    // Set up signal forwarding
+    if (!setup_signal_forwarding()) {
+        return FALSE;
+    }
+
     // First, proxy the D-Bus daemon interface that clients use for service discovery
     if (!discover_and_proxy_object_tree("/org/freedesktop")) {
         log_error("Failed to discover and proxy D-Bus daemon interface");
@@ -584,11 +595,6 @@ static gboolean setup_proxy_interfaces()
     // Start recursive discovery from the root object
     if (!discover_and_proxy_object_tree(proxy_state->config.source_object_path)) {
         log_error("Failed to discover and proxy object tree");
-        return FALSE;
-    }
-    
-    // Set up signal forwarding
-    if (!setup_signal_forwarding()) {
         return FALSE;
     }
     
