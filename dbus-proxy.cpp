@@ -455,47 +455,6 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
     }
 }
 
-#if 0
-// Handle properties changed signals specially
-static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
-                                  const char *sender_name,
-                                  const char *object_path,
-                                  const char *interface_name,
-                                  const char *signal_name,
-                                  GVariant *parameters,
-                                  G_GNUC_UNUSED gpointer user_data)
-{
-    // Only forward signals from our specific source or our specific object path (or child paths)
-    if ((g_strcmp0(sender_name, proxy_state->config.source_bus_name) != 0) ||
-        !g_str_has_prefix(object_path, proxy_state->config.source_object_path)) {
-        return;
-    }
-    
-    const char *changed_interface;
-    g_variant_get_child(parameters, 0, "&s", &changed_interface);
-    
-    log_verbose("Properties changed signal for interface: %s at %s", changed_interface, object_path);
-    
-    // Forward the PropertiesChanged signal
-    GError *error = NULL;
-    gboolean success = g_dbus_connection_emit_signal(
-        proxy_state->target_bus,
-        NULL, // Broadcast to all subscribers
-        object_path, // Use the original object path
-        interface_name,
-        signal_name,
-        parameters,
-        &error);
-    
-    if (success) {
-        log_verbose("PropertiesChanged signal forwarded successfully");
-    } else {
-        log_error("Failed to forward PropertiesChanged signal: %s", error ? error->message : "Unknown error");
-        if (error) g_error_free(error);
-    }
-}
-#endif
-
 // Initialize proxy state
 static gboolean init_proxy_state(const ProxyConfig *config)
 {
@@ -606,31 +565,8 @@ static gboolean setup_signal_forwarding()
         return FALSE;
     }
     
-    log_info("Catch-all signal subscription established (ID: %u)", proxy_state->catch_all_subscription_id);
-    
-    // // Also subscribe specifically to PropertiesChanged signals for better handling
-    // guint props_subscription_id = g_dbus_connection_signal_subscribe(
-    //     proxy_state->source_bus,               
-    //     proxy_state->config.source_bus_name,    // sender (our source service)
-    //     "org.freedesktop.DBus.Properties",      // interface_name
-    //     "PropertiesChanged",                    // member
-    //     NULL,                                   // All object paths (we filter in callback)
-    //     NULL,
-    //     G_DBUS_SIGNAL_FLAGS_NONE,
-    //     on_properties_changed,
-    //     NULL,
-    //     NULL);
-    
-    // if (props_subscription_id == 0) {
-    //     log_error("Failed to set up PropertiesChanged signal subscription");
-    //     return FALSE;
-    // }
-    
-    // g_hash_table_insert(proxy_state->signal_subscriptions,
-    //                    GUINT_TO_POINTER(props_subscription_id),
-    //                    g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
-    
-    // log_info("PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
+    log_info("Catch-all signal subscription established (ID: %u)", proxy_state->catch_all_subscription_id);    
+
     return TRUE;
 }
 
