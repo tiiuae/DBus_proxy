@@ -455,6 +455,7 @@ static void on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSE
     }
 }
 
+#if 0
 // Handle properties changed signals specially
 static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
                                   const char *sender_name,
@@ -493,6 +494,7 @@ static void on_properties_changed(G_GNUC_UNUSED GDBusConnection *connection,
         if (error) g_error_free(error);
     }
 }
+#endif
 
 // Initialize proxy state
 static gboolean init_proxy_state(const ProxyConfig *config)
@@ -606,29 +608,29 @@ static gboolean setup_signal_forwarding()
     
     log_info("Catch-all signal subscription established (ID: %u)", proxy_state->catch_all_subscription_id);
     
-    // Also subscribe specifically to PropertiesChanged signals for better handling
-    guint props_subscription_id = g_dbus_connection_signal_subscribe(
-        proxy_state->source_bus,
-        proxy_state->config.source_bus_name,
-        "org.freedesktop.DBus.Properties",
-        "PropertiesChanged",
-        NULL, // All object paths (we filter in callback)
-        NULL,
-        G_DBUS_SIGNAL_FLAGS_NONE,
-        on_properties_changed,
-        NULL,
-        NULL);
+    // // Also subscribe specifically to PropertiesChanged signals for better handling
+    // guint props_subscription_id = g_dbus_connection_signal_subscribe(
+    //     proxy_state->source_bus,               
+    //     proxy_state->config.source_bus_name,    // sender (our source service)
+    //     "org.freedesktop.DBus.Properties",      // interface_name
+    //     "PropertiesChanged",                    // member
+    //     NULL,                                   // All object paths (we filter in callback)
+    //     NULL,
+    //     G_DBUS_SIGNAL_FLAGS_NONE,
+    //     on_properties_changed,
+    //     NULL,
+    //     NULL);
     
-    if (props_subscription_id == 0) {
-        log_error("Failed to set up PropertiesChanged signal subscription");
-        return FALSE;
-    }
+    // if (props_subscription_id == 0) {
+    //     log_error("Failed to set up PropertiesChanged signal subscription");
+    //     return FALSE;
+    // }
     
-    g_hash_table_insert(proxy_state->signal_subscriptions,
-                       GUINT_TO_POINTER(props_subscription_id),
-                       g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
+    // g_hash_table_insert(proxy_state->signal_subscriptions,
+    //                    GUINT_TO_POINTER(props_subscription_id),
+    //                    g_strdup("org.freedesktop.DBus.Properties.PropertiesChanged"));
     
-    log_info("PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
+    // log_info("PropertiesChanged signal subscription established (ID: %u)", props_subscription_id);
     return TRUE;
 }
 
