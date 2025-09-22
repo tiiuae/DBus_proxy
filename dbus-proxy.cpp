@@ -592,12 +592,6 @@ static gboolean setup_proxy_interfaces()
         return FALSE;
     }
 
-    // // Start recursive discovery from the root object
-    // if (!discover_and_proxy_object_tree(proxy_state->config.source_object_path)) {
-    //     log_error("Failed to discover and proxy object tree");
-    //     return FALSE;
-    // }
-    
     log_info("Object tree proxying complete - %u objects proxied", 
              g_hash_table_size(proxy_state->proxied_objects));
     
