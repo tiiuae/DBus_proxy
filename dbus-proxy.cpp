@@ -580,6 +580,11 @@ static gboolean setup_proxy_interfaces()
 {
     log_info("Setting up proxy interfaces - discovering full object tree");
 
+    // Set up signal forwarding
+    if (!setup_signal_forwarding()) {
+        return FALSE;
+    }
+
     // First, proxy the D-Bus daemon interface that clients use for service discovery
     if (!discover_and_proxy_object_tree("/org/freedesktop")) {
         log_error("Failed to discover and proxy D-Bus daemon interface");
@@ -589,11 +594,6 @@ static gboolean setup_proxy_interfaces()
     // Start recursive discovery from the root object
     if (!discover_and_proxy_object_tree(proxy_state->config.source_object_path)) {
         log_error("Failed to discover and proxy object tree");
-        return FALSE;
-    }
-    
-    // Set up signal forwarding
-    if (!setup_signal_forwarding()) {
         return FALSE;
     }
     
