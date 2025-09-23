@@ -325,7 +325,7 @@ static gboolean proxy_single_object(const char *object_path,
   // List of standard D-Bus interfaces that GDBus provides automatically
   const char *standard_interfaces[] = {
       "org.freedesktop.DBus.Introspectable", "org.freedesktop.DBus.Peer",
-      "org.freedesktop.DBus.Properties", "org.freedesktop.DBus.ObjectManager",
+      "org.freedesktop.DBus.Properties",
       NULL};
 
   // Function to check if interface is standard
