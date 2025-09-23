@@ -352,7 +352,6 @@ static gboolean proxy_single_object(const char *object_path, GDBusNodeInfo *node
         "org.freedesktop.DBus.Introspectable",
         "org.freedesktop.DBus.Peer", 
         "org.freedesktop.DBus.Properties",
-        "org.freedesktop.DBus.ObjectManager",
         NULL
     };
     
