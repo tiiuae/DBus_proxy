@@ -214,6 +214,9 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
     log_verbose("Method call: %s.%s on %s from %s (forwarding to %s)", 
                 interface_name, method_name, object_path, sender, target_object_path);
 
+    // Take a reference to ensure invocation stays alive
+    g_object_ref(invocation);
+
     // Forward the call to the source bus using the original object path
     g_dbus_connection_call(
         proxy_state->source_bus,
@@ -239,6 +242,8 @@ static void handle_method_call_generic(G_GNUC_UNUSED GDBusConnection *connection
                 g_dbus_method_invocation_return_gerror(inv, error);
                 if (error) g_error_free(error);
             }
+            // Release our reference
+            g_object_unref(inv);
         },
         invocation);
 }
