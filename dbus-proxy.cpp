@@ -448,6 +448,7 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
               interface_name, signal_name, sender_name, object_path);
   }
   g_rw_lock_reader_unlock(&proxy_state->rw_lock);
+  log_info("lock released at line %d", __LINE__);
 }
 
 static void update_object_with_new_interfaces(const char *object_path,
