@@ -1,4 +1,9 @@
 /*
+ Copyright 2022-2024 TII (SSRC) and the Ghaf contributors
+ SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
  * Cross-Bus GDBus Proxy that:
  * 1. Connects to two different D-Bus buses (source and target).
  * 2. Fetches introspection data from source service on source bus.
@@ -39,7 +44,7 @@ typedef struct {
   guint catch_interfaces_removed_subscription_id; // For catching
                                                   // InterfacesRemoved
   GHashTable *proxied_objects; // object_path -> ProxiedObject*
-  GMutex availability_mutex;
+  GRWLock rw_lock;
   GMainLoop *main_loop;
 } ProxyState;
 
@@ -323,6 +328,7 @@ static gboolean proxy_single_object(const char *object_path,
   }
 
   log_info("Proxying object: %s", object_path);
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
 
   // Create proxied object structure
   ProxiedObject *proxied_obj = g_new0(ProxiedObject, 1);
@@ -403,6 +409,7 @@ static gboolean proxy_single_object(const char *object_path,
     free_proxied_object(proxied_obj);
   }
 
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
   return TRUE;
 }
 
@@ -414,6 +421,7 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
                             GVariant *parameters,
                             gpointer user_data G_GNUC_UNUSED) {
   // Check if this is a path we're proxying
+  g_rw_lock_reader_lock(&proxy_state->rw_lock);
   if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
       g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
       g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
@@ -436,16 +444,19 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
     log_error("Signal %s.%s from %s at %s ignored (not proxied)",
               interface_name, signal_name, sender_name, object_path);
   }
+  g_rw_lock_reader_unlock(&proxy_state->rw_lock);
 }
 
 static void update_object_with_new_interfaces(const char *object_path,
                                               GVariant *interfaces_dict) {
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
   ProxiedObject *existing_obj = (ProxiedObject *)g_hash_table_lookup(
       proxy_state->proxied_objects, object_path);
   if (!existing_obj) {
     // Object doesn't exist yet, need to create it
     log_info("Object %s not found, creating new proxy", object_path);
     discover_and_proxy_object_tree(object_path);
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     return;
   }
 
@@ -475,6 +486,7 @@ static void update_object_with_new_interfaces(const char *object_path,
     g_free(interface_name);
     g_variant_unref(properties);
   }
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
 }
 
 static gboolean register_single_interface(const char *object_path,
@@ -589,40 +601,7 @@ static void on_interfaces_added(GDBusConnection *connection G_GNUC_UNUSED,
 
   g_variant_unref(interfaces_and_properties);
 }
-#if 0
-// jarekk: removed for now, not tested
-static void on_interfaces_added(GDBusConnection *connection G_GNUC_UNUSED,
-                            const char *sender_name G_GNUC_UNUSED, const char *object_path G_GNUC_UNUSED,
-                            const char *interface_name G_GNUC_UNUSED, const char *signal_name G_GNUC_UNUSED,
-                            GVariant *parameters,
-                            gpointer user_data G_GNUC_UNUSED)
-// We only care about InterfacesAdded signals
-{
-  const char *added_object_path;
-  GVariant *interfaces_and_properties;
-  
-  // InterfacesAdded has signature: (oa{sa{sv}})
-  // object_path + dictionary of interfaces with their properties
-  g_variant_get(parameters, "(&o@a{sa{sv}})", 
-                &added_object_path, 
-                &interfaces_and_properties);
-  
-  log_info("New object appeared in NetworkManager: %s", added_object_path);
-  
-  // Check if we already have this object
-  if (g_hash_table_contains(proxy_state->proxied_objects, added_object_path)) {
-      log_verbose("Object %s already proxied, updating interfaces", added_object_path);
-      // Could update with new interfaces here
-      
-      // update_proxied_object_interfaces(added_object_path, interfaces_and_properties);    jarekk: check it
-  } else {
-      // Introspect and proxy the new object
-      discover_and_proxy_object_tree(added_object_path);
-  }
-  
-  g_variant_unref(interfaces_and_properties);
-}
-#endif
+
 static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
                                   const char *sender_name G_GNUC_UNUSED,
                                   const char *object_path G_GNUC_UNUSED,
@@ -639,7 +618,7 @@ static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
                 &removed_interfaces);
 
   log_info("Object disappeared from NetworkManager: %s", removed_object_path);
-
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
   // Look up the proxied object
   ProxiedObject *obj = (ProxiedObject *)g_hash_table_lookup(
       proxy_state->proxied_objects, removed_object_path);
@@ -660,6 +639,7 @@ static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
   }
 
   g_free(removed_interfaces);
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
 }
 
 static void on_service_vanished(GDBusConnection *connection G_GNUC_UNUSED,
@@ -672,7 +652,7 @@ static void on_service_vanished(GDBusConnection *connection G_GNUC_UNUSED,
 // Initialize proxy state
 static gboolean init_proxy_state(const ProxyConfig *config) {
   proxy_state = g_new0(ProxyState, 1);
-  g_mutex_init(&proxy_state->availability_mutex);
+  g_rw_lock_init(&proxy_state->rw_lock);
   proxy_state->config = *config;
   proxy_state->registered_objects =
       g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -764,6 +744,7 @@ static gboolean fetch_introspection_data() {
 static gboolean setup_signal_forwarding() {
   log_info("Setting up signal forwarding");
 
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
   // Subscribe to ALL signals from the source bus name
   proxy_state->catch_all_subscription_id = g_dbus_connection_signal_subscribe(
       proxy_state->source_bus,
@@ -776,6 +757,7 @@ static gboolean setup_signal_forwarding() {
 
   if (proxy_state->catch_all_subscription_id == 0) {
     log_error("Failed to set up catch-all signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     return FALSE;
   }
   g_hash_table_insert(proxy_state->signal_subscriptions,
@@ -795,6 +777,7 @@ static gboolean setup_signal_forwarding() {
 
   if (proxy_state->catch_interfaces_added_subscription_id == 0) {
     log_error("Failed to set up InterfacesAdded signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     return FALSE;
   }
   g_hash_table_insert(
@@ -815,6 +798,7 @@ static gboolean setup_signal_forwarding() {
 
   if (proxy_state->catch_interfaces_removed_subscription_id == 0) {
     log_error("Failed to set up InterfacesRemoved signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     return FALSE;
   }
   g_hash_table_insert(
@@ -823,6 +807,7 @@ static gboolean setup_signal_forwarding() {
       g_strdup("InterfacesRemoved"));
   log_info("InterfacesRemoved signal subscription established (ID: %u)",
            proxy_state->catch_interfaces_removed_subscription_id);
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
   return TRUE;
 }
 
@@ -889,6 +874,7 @@ static void cleanup_proxy_state() {
   if (!proxy_state)
     return;
 
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
   // Unregister objects
   if (proxy_state->registered_objects) {
     GHashTableIter iter;
@@ -936,7 +922,6 @@ static void cleanup_proxy_state() {
     }
     g_hash_table_destroy(proxy_state->signal_subscriptions);
   }
-
   if (proxy_state->proxied_objects) {
     g_hash_table_destroy(proxy_state->proxied_objects);
   }
@@ -953,6 +938,7 @@ static void cleanup_proxy_state() {
     g_object_unref(proxy_state->target_bus);
   }
 
+  g_rw_lock_clear(&proxy_state->rw_lock);
   g_free(proxy_state);
   proxy_state = NULL;
 }
