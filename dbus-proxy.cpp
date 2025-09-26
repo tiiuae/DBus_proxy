@@ -329,6 +329,7 @@ static gboolean proxy_single_object(const char *object_path,
 
   log_info("Proxying object: %s", object_path);
   g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  log_info("lock acquired at line %d", __LINE__);
 
   // Create proxied object structure
   ProxiedObject *proxied_obj = g_new0(ProxiedObject, 1);
@@ -410,6 +411,7 @@ static gboolean proxy_single_object(const char *object_path,
   }
 
   g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  log_info("lock released at line %d", __LINE__);
   return TRUE;
 }
 
@@ -422,6 +424,7 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
                             gpointer user_data G_GNUC_UNUSED) {
   // Check if this is a path we're proxying
   g_rw_lock_reader_lock(&proxy_state->rw_lock);
+  log_info("lock acquired at line %d", __LINE__);
   if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
       g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
       g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
@@ -450,6 +453,7 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
 static void update_object_with_new_interfaces(const char *object_path,
                                               GVariant *interfaces_dict) {
   g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  log_info("lock acquired at line %d", __LINE__);
   ProxiedObject *existing_obj = (ProxiedObject *)g_hash_table_lookup(
       proxy_state->proxied_objects, object_path);
   if (!existing_obj) {
@@ -457,6 +461,7 @@ static void update_object_with_new_interfaces(const char *object_path,
     log_info("Object %s not found, creating new proxy", object_path);
     discover_and_proxy_object_tree(object_path);
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    log_info("lock released at line %d", __LINE__);
     return;
   }
 
@@ -487,6 +492,7 @@ static void update_object_with_new_interfaces(const char *object_path,
     g_variant_unref(properties);
   }
   g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  log_info("lock released at line %d", __LINE__);
 }
 
 static gboolean register_single_interface(const char *object_path,
@@ -619,6 +625,7 @@ static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
 
   log_info("Object disappeared from NetworkManager: %s", removed_object_path);
   g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  log_info("lock acquired at line %d", __LINE__);
   // Look up the proxied object
   ProxiedObject *obj = (ProxiedObject *)g_hash_table_lookup(
       proxy_state->proxied_objects, removed_object_path);
@@ -640,6 +647,7 @@ static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
 
   g_free(removed_interfaces);
   g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  log_info("lock released at line %d", __LINE__);
 }
 
 static void on_service_vanished(GDBusConnection *connection G_GNUC_UNUSED,
@@ -758,6 +766,7 @@ static gboolean setup_signal_forwarding() {
   if (proxy_state->catch_all_subscription_id == 0) {
     log_error("Failed to set up catch-all signal subscription");
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    log_info("lock released at line %d", __LINE__);
     return FALSE;
   }
   g_hash_table_insert(proxy_state->signal_subscriptions,
@@ -778,6 +787,7 @@ static gboolean setup_signal_forwarding() {
   if (proxy_state->catch_interfaces_added_subscription_id == 0) {
     log_error("Failed to set up InterfacesAdded signal subscription");
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    log_info("lock released at line %d", __LINE__);
     return FALSE;
   }
   g_hash_table_insert(
@@ -799,6 +809,7 @@ static gboolean setup_signal_forwarding() {
   if (proxy_state->catch_interfaces_removed_subscription_id == 0) {
     log_error("Failed to set up InterfacesRemoved signal subscription");
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    log_info("lock released at line %d", __LINE__);
     return FALSE;
   }
   g_hash_table_insert(
@@ -808,6 +819,7 @@ static gboolean setup_signal_forwarding() {
   log_info("InterfacesRemoved signal subscription established (ID: %u)",
            proxy_state->catch_interfaces_removed_subscription_id);
   g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  log_info("lock released at line %d", __LINE__);
   return TRUE;
 }
 
@@ -875,6 +887,7 @@ static void cleanup_proxy_state() {
     return;
 
   g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  log_info("lock acquired at line %d", __LINE__);
   // Unregister objects
   if (proxy_state->registered_objects) {
     GHashTableIter iter;
