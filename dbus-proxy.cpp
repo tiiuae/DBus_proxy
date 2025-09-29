@@ -436,7 +436,7 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
   g_rw_lock_reader_lock(&proxy_state->rw_lock);
   gboolean is_proxied = g_hash_table_contains(proxy_state->proxied_objects, object_path);                              
   g_rw_lock_reader_unlock(&proxy_state->rw_lock);
-  
+
   // Forward only if it's a proxied object or the D-Bus daemon itself
   if (is_proxied ||
       g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
@@ -471,8 +471,8 @@ static void update_object_with_new_interfaces(const char *object_path,
   if (!existing_obj) {
     // Object doesn't exist yet, need to create it
     log_info("Object %s not found, creating new proxy", object_path);
-    discover_and_proxy_object_tree(object_path, TRUE);
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    discover_and_proxy_object_tree(object_path, TRUE);
     log_info("lock released at line %d", __LINE__);
     return;
   }
