@@ -59,7 +59,7 @@ static ProxyState *proxy_state = NULL;
 
 // Logging functions
 static void log_verbose(const char *format, ...) {
-  if (!proxy_state->config.verbose)
+  if (proxy_state && !proxy_state->config.verbose)
     return;
 
   va_list args;
@@ -80,7 +80,7 @@ static void log_error(const char *format, ...) {
 }
 
 static void log_info(const char *format, ...) {
-  if (!proxy_state->config.info)
+  if (proxy_state && !proxy_state->config.info)
     return;
 
   va_list args;
