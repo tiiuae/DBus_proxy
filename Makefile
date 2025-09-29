@@ -13,7 +13,7 @@ all: $(TARGET)
 
 # Main build rule
 $(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(PKG_CONFIG_FLAGS)
+	$(CXX) $(CXXFLAGS) -g $^ -o $@ $(PKG_CONFIG_FLAGS)
 
 # Compile source files
 %.o: %.cpp

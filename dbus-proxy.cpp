@@ -889,8 +889,6 @@ static void cleanup_proxy_state() {
   if (!proxy_state)
     return;
 
-  log_info("lock acquired at line %d", __LINE__);
-  g_rw_lock_writer_lock(&proxy_state->rw_lock);
   // Unregister objects
   if (proxy_state->registered_objects) {
     GHashTableIter iter;
@@ -954,7 +952,6 @@ static void cleanup_proxy_state() {
     g_object_unref(proxy_state->target_bus);
   }
 
-  g_rw_lock_clear(&proxy_state->rw_lock);
   g_free(proxy_state);
   proxy_state = NULL;
 }
