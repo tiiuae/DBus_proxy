@@ -92,7 +92,7 @@ const char *standard_interfaces[] = {"org.freedesktop.DBus.Introspectable",
                                      "org.freedesktop.DBus.Properties", NULL};
 
 static gboolean proxy_single_object(const char *object_path,
-                                    GDBusNodeInfo *node_info);
+                                    GDBusNodeInfo *node_info, gboolean need_lock);
 
 static gboolean register_single_interface(const char *object_path,
                                           const char *interface_name,
@@ -115,7 +115,7 @@ static void free_proxied_object(gpointer data) {
 }
 
 // Recursively discover and proxy all objects starting from a base path
-static gboolean discover_and_proxy_object_tree(const char *base_path) {
+static gboolean discover_and_proxy_object_tree(const char *base_path, gboolean need_lock) {
   GError *error = NULL;
 
   log_info("Discovering object tree starting from: %s", base_path);
@@ -180,8 +180,12 @@ static gboolean discover_and_proxy_object_tree(const char *base_path) {
     log_verbose("No child nodes found for %s", base_path);
   }
 
+  if (need_lock) {
+    log_info("lock acquired at line %d", __LINE__);
+    g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  }
   // Proxy this object if it has interfaces
-  if (!proxy_single_object(base_path, node_info)) {
+  if (!proxy_single_object(base_path, node_info, FALSE)) {
     g_dbus_node_info_unref(node_info);
     return FALSE;
   }
@@ -206,12 +210,15 @@ static gboolean discover_and_proxy_object_tree(const char *base_path) {
       log_verbose("Recursively processing child: %s", child_path);
 
       // Recurse into child (don't fail if child fails)
-      discover_and_proxy_object_tree(child_path);
+      discover_and_proxy_object_tree(child_path, FALSE);
 
       g_free(child_path);
     }
   }
-
+  if (need_lock) {
+    log_info("lock released at line %d", __LINE__);
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  }
   g_dbus_node_info_unref(node_info);
   return TRUE;
 }
@@ -320,7 +327,7 @@ handle_set_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
 
 // Proxy a single object with all its interfaces
 static gboolean proxy_single_object(const char *object_path,
-                                    GDBusNodeInfo *node_info) {
+                                    GDBusNodeInfo *node_info, gboolean need_lock) {
   // Skip if no interfaces to proxy
   if (!node_info->interfaces || !node_info->interfaces[0]) {
     log_verbose("Object %s has no interfaces, skipping", object_path);
@@ -328,9 +335,10 @@ static gboolean proxy_single_object(const char *object_path,
   }
 
   log_info("Proxying object: %s", object_path);
-  log_info("lock acquired at line %d", __LINE__);
-  g_rw_lock_writer_lock(&proxy_state->rw_lock);
-
+  if (need_lock) {
+    log_info("lock acquired at line %d", __LINE__);
+    g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  }
   // Create proxied object structure
   ProxiedObject *proxied_obj = g_new0(ProxiedObject, 1);
   proxied_obj->object_path = g_strdup(object_path);
@@ -410,8 +418,10 @@ static gboolean proxy_single_object(const char *object_path,
     free_proxied_object(proxied_obj);
   }
 
-  log_info("lock released at line %d", __LINE__);
-  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  if (need_lock) {
+    log_info("lock released at line %d", __LINE__);
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  }
   return TRUE;
 }
 
@@ -423,9 +433,12 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
                             GVariant *parameters,
                             gpointer user_data G_GNUC_UNUSED) {
   // Check if this is a path we're proxying
-  log_info("lock acquired at line %d", __LINE__);
   g_rw_lock_reader_lock(&proxy_state->rw_lock);
-  if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
+  gboolean is_proxied = g_hash_table_contains(proxy_state->proxied_objects, object_path);                              
+  g_rw_lock_reader_unlock(&proxy_state->rw_lock);
+  
+  // Forward only if it's a proxied object or the D-Bus daemon itself
+  if (is_proxied ||
       g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
       g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
 
@@ -447,8 +460,6 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
     log_error("Signal %s.%s from %s at %s ignored (not proxied)",
               interface_name, signal_name, sender_name, object_path);
   }
-  g_rw_lock_reader_unlock(&proxy_state->rw_lock);
-  log_info("lock released at line %d", __LINE__);
 }
 
 static void update_object_with_new_interfaces(const char *object_path,
@@ -460,7 +471,7 @@ static void update_object_with_new_interfaces(const char *object_path,
   if (!existing_obj) {
     // Object doesn't exist yet, need to create it
     log_info("Object %s not found, creating new proxy", object_path);
-    discover_and_proxy_object_tree(object_path);
+    discover_and_proxy_object_tree(object_path, TRUE);
     g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     log_info("lock released at line %d", __LINE__);
     return;
@@ -837,7 +848,7 @@ static gboolean setup_proxy_interfaces() {
 
   // First, proxy the D-Bus daemon interface that clients use for service
   // discovery
-  if (!discover_and_proxy_object_tree("/org/freedesktop")) {
+  if (!discover_and_proxy_object_tree("/org/freedesktop", TRUE)) {
     log_error("Failed to discover and proxy D-Bus daemon interface");
     return FALSE;
   }
