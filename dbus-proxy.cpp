@@ -1,5 +1,10 @@
 /*
- * Enhanced Cross-Bus GDBus Proxy that:
+ Copyright 2022-2024 TII (SSRC) and the Ghaf contributors
+ SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Cross-Bus GDBus Proxy that:
  * 1. Connects to two different D-Bus buses (source and target).
  * 2. Fetches introspection data from source service on source bus.
  * 3. Exposes that interface on target bus with proxy name.
@@ -22,6 +27,7 @@ typedef struct {
   GBusType source_bus_type;
   GBusType target_bus_type;
   gboolean verbose;
+  gboolean info;
 } ProxyConfig;
 
 // Global state
@@ -33,8 +39,14 @@ typedef struct {
   GHashTable *signal_subscriptions; // Track signal subscription IDs
   ProxyConfig config;
   guint name_owner_watch_id;
-  guint catch_all_subscription_id; // For catching all signals
-  GHashTable *proxied_objects;     // object_path -> ProxiedObject*
+  guint source_service_watch_id;
+  guint catch_all_subscription_id;              // For catching all signals
+  guint catch_interfaces_added_subscription_id; // For catching InterfacesAdded
+  guint catch_interfaces_removed_subscription_id; // For catching
+                                                  // InterfacesRemoved
+  GHashTable *proxied_objects; // object_path -> ProxiedObject*
+  GRWLock rw_lock;
+  GMainLoop *main_loop;
 } ProxyState;
 
 // Structure to track proxied objects
@@ -47,7 +59,7 @@ static ProxyState *proxy_state = NULL;
 
 // Logging functions
 static void log_verbose(const char *format, ...) {
-  if (!proxy_state->config.verbose)
+  if (proxy_state && !proxy_state->config.verbose)
     return;
 
   va_list args;
@@ -68,6 +80,9 @@ static void log_error(const char *format, ...) {
 }
 
 static void log_info(const char *format, ...) {
+  if (proxy_state && !proxy_state->config.info)
+    return;
+
   va_list args;
   va_start(args, format);
   g_print("[INFO] ");
@@ -76,8 +91,17 @@ static void log_info(const char *format, ...) {
   va_end(args);
 }
 
+const char *standard_interfaces[] = {"org.freedesktop.DBus.Introspectable",
+                                     "org.freedesktop.DBus.Peer",
+                                     "org.freedesktop.DBus.Properties", NULL};
+
 static gboolean proxy_single_object(const char *object_path,
-                                    GDBusNodeInfo *node_info);
+                                    GDBusNodeInfo *node_info,
+                                    gboolean need_lock);
+
+static gboolean register_single_interface(const char *object_path,
+                                          const char *interface_name,
+                                          ProxiedObject *proxied_obj);
 
 // Free function for ProxiedObject
 static void free_proxied_object(gpointer data) {
@@ -96,7 +120,8 @@ static void free_proxied_object(gpointer data) {
 }
 
 // Recursively discover and proxy all objects starting from a base path
-static gboolean discover_and_proxy_object_tree(const char *base_path) {
+static gboolean discover_and_proxy_object_tree(const char *base_path,
+                                               gboolean need_lock) {
   GError *error = NULL;
 
   log_info("Discovering object tree starting from: %s", base_path);
@@ -161,9 +186,15 @@ static gboolean discover_and_proxy_object_tree(const char *base_path) {
     log_verbose("No child nodes found for %s", base_path);
   }
 
+  if (need_lock) {
+    g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  }
   // Proxy this object if it has interfaces
-  if (!proxy_single_object(base_path, node_info)) {
+  if (!proxy_single_object(base_path, node_info, FALSE)) {
     g_dbus_node_info_unref(node_info);
+    if (need_lock) {
+      g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    }
     return FALSE;
   }
 
@@ -187,12 +218,14 @@ static gboolean discover_and_proxy_object_tree(const char *base_path) {
       log_verbose("Recursively processing child: %s", child_path);
 
       // Recurse into child (don't fail if child fails)
-      discover_and_proxy_object_tree(child_path);
+      discover_and_proxy_object_tree(child_path, FALSE);
 
       g_free(child_path);
     }
   }
-
+  if (need_lock) {
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  }
   g_dbus_node_info_unref(node_info);
   return TRUE;
 }
@@ -301,7 +334,8 @@ handle_set_property_generic(G_GNUC_UNUSED GDBusConnection *connection,
 
 // Proxy a single object with all its interfaces
 static gboolean proxy_single_object(const char *object_path,
-                                    GDBusNodeInfo *node_info) {
+                                    GDBusNodeInfo *node_info,
+                                    gboolean need_lock) {
   // Skip if no interfaces to proxy
   if (!node_info->interfaces || !node_info->interfaces[0]) {
     log_verbose("Object %s has no interfaces, skipping", object_path);
@@ -309,7 +343,9 @@ static gboolean proxy_single_object(const char *object_path,
   }
 
   log_info("Proxying object: %s", object_path);
-
+  if (need_lock) {
+    g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  }
   // Create proxied object structure
   ProxiedObject *proxied_obj = g_new0(ProxiedObject, 1);
   proxied_obj->object_path = g_strdup(object_path);
@@ -321,12 +357,6 @@ static gboolean proxy_single_object(const char *object_path,
                                  .get_property = handle_get_property_generic,
                                  .set_property = handle_set_property_generic,
                                  .padding = {0}};
-
-  // List of standard D-Bus interfaces that GDBus provides automatically
-  const char *standard_interfaces[] = {
-      "org.freedesktop.DBus.Introspectable", "org.freedesktop.DBus.Peer",
-      "org.freedesktop.DBus.Properties",
-      NULL};
 
   // Function to check if interface is standard
   auto is_standard_interface = [](const char *interface_name,
@@ -395,6 +425,9 @@ static gboolean proxy_single_object(const char *object_path,
     free_proxied_object(proxied_obj);
   }
 
+  if (need_lock) {
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+  }
   return TRUE;
 }
 
@@ -406,7 +439,13 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
                             GVariant *parameters,
                             gpointer user_data G_GNUC_UNUSED) {
   // Check if this is a path we're proxying
-  if (g_hash_table_contains(proxy_state->proxied_objects, object_path) ||
+  g_rw_lock_reader_lock(&proxy_state->rw_lock);
+  gboolean is_proxied =
+      g_hash_table_contains(proxy_state->proxied_objects, object_path);
+  g_rw_lock_reader_unlock(&proxy_state->rw_lock);
+
+  // Forward only if it's a proxied object or the D-Bus daemon itself
+  if (is_proxied ||
       g_str_has_prefix(object_path, proxy_state->config.source_object_path) ||
       g_strcmp0(object_path, "/org/freedesktop/DBus") == 0) {
 
@@ -430,15 +469,222 @@ on_signal_received_catchall(GDBusConnection *connection G_GNUC_UNUSED,
   }
 }
 
+static void update_object_with_new_interfaces(const char *object_path,
+                                              GVariant *interfaces_dict) {
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  ProxiedObject *existing_obj = (ProxiedObject *)g_hash_table_lookup(
+      proxy_state->proxied_objects, object_path);
+  if (!existing_obj) {
+    // Object doesn't exist yet, need to create it
+    log_info("Object %s not found, creating new proxy", object_path);
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    discover_and_proxy_object_tree(object_path, TRUE);
+    return;
+  }
+
+  // Iterate through the new interfaces
+  GVariantIter iter;
+  char *interface_name;
+  GVariant *properties;
+
+  if (g_variant_iter_init(&iter, interfaces_dict)) {
+    while (
+        g_variant_iter_next(&iter, "{s@a{sv}}", &interface_name, &properties)) {
+      // Check if this interface is already registered
+      if (g_hash_table_contains(existing_obj->registration_ids,
+                                interface_name)) {
+        log_verbose("Interface %s already registered on %s", interface_name,
+                    object_path);
+        g_free(interface_name);
+        g_variant_unref(properties);
+        continue;
+      }
+
+      log_info("Adding new interface %s to object %s", interface_name,
+               object_path);
+
+      // Register the new interface
+      register_single_interface(object_path, interface_name, existing_obj);
+
+      g_free(interface_name);
+      g_variant_unref(properties);
+    }
+  }
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+}
+
+static gboolean register_single_interface(const char *object_path,
+                                          const char *interface_name,
+                                          ProxiedObject *proxied_obj) {
+  // Skip standard interfaces
+  for (int i = 0; standard_interfaces[i]; i++) {
+    if (g_strcmp0(interface_name, standard_interfaces[i]) == 0) {
+      log_verbose("Skipping standard interface: %s", interface_name);
+      return TRUE;
+    }
+  }
+
+  // Need to get interface info - introspect the object
+  GError *error = NULL;
+  GVariant *xml_variant = g_dbus_connection_call_sync(
+      proxy_state->source_bus, proxy_state->config.source_bus_name, object_path,
+      "org.freedesktop.DBus.Introspectable", "Introspect", NULL,
+      G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, &error);
+
+  if (!xml_variant) {
+    log_error("Failed to introspect %s for interface %s: %s", object_path,
+              interface_name, error ? error->message : "Unknown");
+    if (error)
+      g_error_free(error);
+    return FALSE;
+  }
+
+  const char *xml_data;
+  g_variant_get(xml_variant, "(s)", &xml_data);
+
+  GDBusNodeInfo *node_info = g_dbus_node_info_new_for_xml(xml_data, &error);
+  g_variant_unref(xml_variant);
+
+  if (!node_info) {
+    log_error("Failed to parse introspection XML: %s",
+              error ? error->message : "Unknown");
+    if (error)
+      g_error_free(error);
+    return FALSE;
+  }
+
+  // Find the specific interface
+  GDBusInterfaceInfo *iface_info = NULL;
+  for (int i = 0; node_info->interfaces && node_info->interfaces[i]; i++) {
+    if (g_strcmp0(node_info->interfaces[i]->name, interface_name) == 0) {
+      iface_info = node_info->interfaces[i];
+      break;
+    }
+  }
+
+  if (!iface_info) {
+    log_error("Interface %s not found in introspection data", interface_name);
+    g_dbus_node_info_unref(node_info);
+    return FALSE;
+  }
+
+  // Register the interface
+  GDBusInterfaceVTable vtable = {.method_call = handle_method_call_generic,
+                                 .get_property = handle_get_property_generic,
+                                 .set_property = handle_set_property_generic,
+                                 .padding = {0}};
+
+  guint registration_id = g_dbus_connection_register_object(
+      proxy_state->target_bus, object_path, iface_info, &vtable,
+      g_strdup(object_path), g_free, &error);
+
+  if (registration_id == 0) {
+    log_error("Failed to register interface %s on %s: %s", interface_name,
+              object_path, error ? error->message : "Unknown");
+    if (error)
+      g_error_free(error);
+    g_dbus_node_info_unref(node_info);
+    return FALSE;
+  }
+
+  // Store registration ID
+  g_hash_table_insert(proxied_obj->registration_ids, g_strdup(interface_name),
+                      GUINT_TO_POINTER(registration_id));
+
+  // Also add to global registry
+  g_hash_table_insert(proxy_state->registered_objects,
+                      GUINT_TO_POINTER(registration_id),
+                      g_strdup_printf("%s:%s", object_path, interface_name));
+
+  log_info("Successfully registered interface %s on %s (ID: %u)",
+           interface_name, object_path, registration_id);
+
+  g_dbus_node_info_unref(node_info);
+  return TRUE;
+}
+
+// Forward signals from source bus to target bus - InterfacesAdded handler
+static void on_interfaces_added(GDBusConnection *connection G_GNUC_UNUSED,
+                                const char *sender_name G_GNUC_UNUSED,
+                                const char *object_path G_GNUC_UNUSED,
+                                const char *interface_name G_GNUC_UNUSED,
+                                const char *signal_name G_GNUC_UNUSED,
+                                GVariant *parameters,
+                                gpointer user_data G_GNUC_UNUSED) {
+  const char *added_object_path;
+  GVariant *interfaces_and_properties;
+
+  g_variant_get(parameters, "(&o@a{sa{sv}})", &added_object_path,
+                &interfaces_and_properties);
+
+  log_info("InterfacesAdded signal for: %s", added_object_path);
+
+  // Update or create the object with new interfaces
+  update_object_with_new_interfaces(added_object_path,
+                                    interfaces_and_properties);
+
+  g_variant_unref(interfaces_and_properties);
+}
+
+static void on_interfaces_removed(GDBusConnection *connection G_GNUC_UNUSED,
+                                  const char *sender_name G_GNUC_UNUSED,
+                                  const char *object_path G_GNUC_UNUSED,
+                                  const char *interface_name G_GNUC_UNUSED,
+                                  const char *signal_name G_GNUC_UNUSED,
+                                  GVariant *parameters,
+                                  gpointer user_data G_GNUC_UNUSED) {
+  const char *removed_object_path;
+  const char **removed_interfaces;
+
+  // InterfacesRemoved has signature: (oas)
+  // object_path + array of interface names
+  g_variant_get(parameters, "(&o^as)", &removed_object_path,
+                &removed_interfaces);
+
+  log_info("Object disappeared from NetworkManager: %s", removed_object_path);
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
+  // Look up the proxied object
+  ProxiedObject *obj = (ProxiedObject *)g_hash_table_lookup(
+      proxy_state->proxied_objects, removed_object_path);
+  if (obj) {
+    // Unregister all interfaces for this object
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, obj->registration_ids);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+      guint reg_id = GPOINTER_TO_UINT(value);
+      g_dbus_connection_unregister_object(proxy_state->target_bus, reg_id);
+      log_verbose("Unregistered interface %s on %s", (char *)key,
+                  removed_object_path);
+    }
+
+    // Remove from our cache
+    g_hash_table_remove(proxy_state->proxied_objects, removed_object_path);
+  }
+
+  g_free(removed_interfaces);
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+}
+
+static void on_service_vanished(GDBusConnection *connection G_GNUC_UNUSED,
+                                const gchar *name G_GNUC_UNUSED,
+                                gpointer user_data G_GNUC_UNUSED) {
+  log_info("%s vanished. Exiting", proxy_state->config.source_bus_name);
+  g_main_loop_quit(proxy_state->main_loop);
+}
+
 // Initialize proxy state
 static gboolean init_proxy_state(const ProxyConfig *config) {
   proxy_state = g_new0(ProxyState, 1);
+  g_rw_lock_init(&proxy_state->rw_lock);
   proxy_state->config = *config;
   proxy_state->registered_objects =
       g_hash_table_new(g_direct_hash, g_direct_equal);
   proxy_state->signal_subscriptions =
       g_hash_table_new(g_direct_hash, g_direct_equal);
   proxy_state->catch_all_subscription_id = 0;
+  proxy_state->catch_interfaces_added_subscription_id = 0;
+  proxy_state->catch_interfaces_removed_subscription_id = 0;
   proxy_state->proxied_objects = g_hash_table_new_full(
       g_str_hash, g_str_equal, g_free, free_proxied_object);
 
@@ -522,24 +768,71 @@ static gboolean fetch_introspection_data() {
 static gboolean setup_signal_forwarding() {
   log_info("Setting up signal forwarding");
 
+  g_rw_lock_writer_lock(&proxy_state->rw_lock);
+
   // Subscribe to ALL signals from the source bus name
   proxy_state->catch_all_subscription_id = g_dbus_connection_signal_subscribe(
       proxy_state->source_bus,
       proxy_state->config.source_bus_name, // sender (our source service)
       NULL,                                // interface_name (all interfaces)
-      NULL,                                // member (all signals)
+      NULL,                                // method: member (all signals)
       NULL, // object_path (all paths - we filter in callback)
       NULL, // arg0 (no filtering)
       G_DBUS_SIGNAL_FLAGS_NONE, on_signal_received_catchall, NULL, NULL);
 
   if (proxy_state->catch_all_subscription_id == 0) {
     log_error("Failed to set up catch-all signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
     return FALSE;
   }
-
+  g_hash_table_insert(proxy_state->signal_subscriptions,
+                      GUINT_TO_POINTER(proxy_state->catch_all_subscription_id),
+                      g_strdup("catch-all"));
   log_info("Catch-all signal subscription established (ID: %u)",
            proxy_state->catch_all_subscription_id);
 
+  proxy_state->catch_interfaces_added_subscription_id =
+      g_dbus_connection_signal_subscribe(
+          proxy_state->source_bus, proxy_state->config.source_bus_name,
+          "org.freedesktop.DBus.ObjectManager", // interface
+          "InterfacesAdded",                    // method: New objects appear
+          NULL,                                 // Any object path
+          NULL,                                 // No arg0 filtering
+          G_DBUS_SIGNAL_FLAGS_NONE, on_interfaces_added, NULL, NULL);
+
+  if (proxy_state->catch_interfaces_added_subscription_id == 0) {
+    log_error("Failed to set up InterfacesAdded signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    return FALSE;
+  }
+  g_hash_table_insert(
+      proxy_state->signal_subscriptions,
+      GUINT_TO_POINTER(proxy_state->catch_interfaces_added_subscription_id),
+      g_strdup("InterfacesAdded"));
+  log_info("InterfacesAdded signal subscription established (ID: %u)",
+           proxy_state->catch_interfaces_added_subscription_id);
+
+  proxy_state->catch_interfaces_removed_subscription_id =
+      g_dbus_connection_signal_subscribe(
+          proxy_state->source_bus, proxy_state->config.source_bus_name,
+          "org.freedesktop.DBus.ObjectManager", // interface
+          "InterfacesRemoved",                  // method: Objects removed
+          NULL,                                 // Any object path
+          NULL,                                 // No arg0 filtering
+          G_DBUS_SIGNAL_FLAGS_NONE, on_interfaces_removed, NULL, NULL);
+
+  if (proxy_state->catch_interfaces_removed_subscription_id == 0) {
+    log_error("Failed to set up InterfacesRemoved signal subscription");
+    g_rw_lock_writer_unlock(&proxy_state->rw_lock);
+    return FALSE;
+  }
+  g_hash_table_insert(
+      proxy_state->signal_subscriptions,
+      GUINT_TO_POINTER(proxy_state->catch_interfaces_removed_subscription_id),
+      g_strdup("InterfacesRemoved"));
+  log_info("InterfacesRemoved signal subscription established (ID: %u)",
+           proxy_state->catch_interfaces_removed_subscription_id);
+  g_rw_lock_writer_unlock(&proxy_state->rw_lock);
   return TRUE;
 }
 
@@ -554,7 +847,7 @@ static gboolean setup_proxy_interfaces() {
 
   // First, proxy the D-Bus daemon interface that clients use for service
   // discovery
-  if (!discover_and_proxy_object_tree("/org/freedesktop")) {
+  if (!discover_and_proxy_object_tree("/org/freedesktop", TRUE)) {
     log_error("Failed to discover and proxy D-Bus daemon interface");
     return FALSE;
   }
@@ -625,7 +918,22 @@ static void cleanup_proxy_state() {
         proxy_state->source_bus, proxy_state->catch_all_subscription_id);
     proxy_state->catch_all_subscription_id = 0;
   }
-
+  // Unsubscribe from InterfacesAdded signal
+  if (proxy_state->catch_interfaces_added_subscription_id &&
+      proxy_state->source_bus) {
+    g_dbus_connection_signal_unsubscribe(
+        proxy_state->source_bus,
+        proxy_state->catch_interfaces_added_subscription_id);
+    proxy_state->catch_interfaces_added_subscription_id = 0;
+  }
+  // Unsubscribe from InterfacesRemoved signal
+  if (proxy_state->catch_interfaces_removed_subscription_id &&
+      proxy_state->source_bus) {
+    g_dbus_connection_signal_unsubscribe(
+        proxy_state->source_bus,
+        proxy_state->catch_interfaces_removed_subscription_id);
+    proxy_state->catch_interfaces_removed_subscription_id = 0;
+  }
   // Clean up individual signal subscriptions (like PropertiesChanged)
   if (proxy_state->signal_subscriptions) {
     GHashTableIter iter;
@@ -638,7 +946,6 @@ static void cleanup_proxy_state() {
     }
     g_hash_table_destroy(proxy_state->signal_subscriptions);
   }
-
   if (proxy_state->proxied_objects) {
     g_hash_table_destroy(proxy_state->proxied_objects);
   }
@@ -693,6 +1000,7 @@ static void print_usage(const char *program_name) {
   g_print("  --target-bus-type TYPE     Target bus type: system|session "
           "(default: session)\n");
   g_print("  --verbose                  Enable verbose logging\n");
+  g_print("  --info                     Enable informational logging\n");
   g_print("  --help                     Show this help message\n");
 }
 
@@ -719,80 +1027,112 @@ int main(int argc, char *argv[]) {
                         .proxy_bus_name = "",
                         .source_bus_type = G_BUS_TYPE_SYSTEM,
                         .target_bus_type = G_BUS_TYPE_SESSION,
-                        .verbose = FALSE};
+                        .verbose = FALSE,
+                        .info = FALSE};
 
-  // Parse command line arguments
-  for (int i = 0; i < argc; i++) {
-    if (g_strcmp0(argv[i], "--source-bus-name") == 0 && i + 1 < argc) {
-      config.source_bus_name = argv[++i];
-    } else if (g_strcmp0(argv[i], "--source-object-path") == 0 &&
-               i + 1 < argc) {
-      config.source_object_path = argv[++i];
-    } else if (g_strcmp0(argv[i], "--proxy-bus-name") == 0 && i + 1 < argc) {
-      config.proxy_bus_name = argv[++i];
-    } else if (g_strcmp0(argv[i], "--source-bus-type") == 0 && i + 1 < argc) {
-      config.source_bus_type = parse_bus_type(argv[++i]);
-    } else if (g_strcmp0(argv[i], "--target-bus-type") == 0 && i + 1 < argc) {
-      config.target_bus_type = parse_bus_type(argv[++i]);
-    } else if (g_strcmp0(argv[i], "--verbose") == 0) {
-      config.verbose = TRUE;
-    } else if (g_strcmp0(argv[i], "--help") == 0 ||
-               g_strcmp0(argv[i], "-h") == 0 || argc == 1) {
-      print_usage(argv[0]);
-      return 0;
-    }
+// Parse command line arguments
+for (int i = 0; i < argc; i++) {
+  if (g_strcmp0(argv[i], "--source-bus-name") == 0 && i + 1 < argc) {
+    config.source_bus_name = argv[++i];
+  } else if (g_strcmp0(argv[i], "--source-object-path") == 0 && i + 1 < argc) {
+    config.source_object_path = argv[++i];
+  } else if (g_strcmp0(argv[i], "--proxy-bus-name") == 0 && i + 1 < argc) {
+    config.proxy_bus_name = argv[++i];
+  } else if (g_strcmp0(argv[i], "--source-bus-type") == 0 && i + 1 < argc) {
+    config.source_bus_type = parse_bus_type(argv[++i]);
+  } else if (g_strcmp0(argv[i], "--target-bus-type") == 0 && i + 1 < argc) {
+    config.target_bus_type = parse_bus_type(argv[++i]);
+  } else if (g_strcmp0(argv[i], "--verbose") == 0) {
+    config.verbose = TRUE;
+  } else if (g_strcmp0(argv[i], "--info") == 0) {
+    config.info = TRUE;
+  } else if (g_strcmp0(argv[i], "--fatal-warnings") == 0) {
+    g_setenv("DBUS_FATAL_WARNINGS", "1", TRUE);
+  } else if (g_strcmp0(argv[i], "--help") == 0 ||
+             g_strcmp0(argv[i], "-h") == 0 || argc == 1) {
+    print_usage(argv[0]);
+    return 0;
   }
+}
 
-  // Validate configuration
-  validateProxyConfigOrExit(&config);
+// Validate configuration
+validateProxyConfigOrExit(&config);
 
-  // Set up signal handlers
-  signal(SIGINT, signal_handler);
-  signal(SIGTERM, signal_handler);
+// Set up signal handlers
+signal(SIGINT, signal_handler);
+signal(SIGTERM, signal_handler);
 
-  log_info("Starting cross-bus D-Bus proxy");
-  log_info("Source: %s%s on %s bus", config.source_bus_name,
-           config.source_object_path,
-           config.source_bus_type == G_BUS_TYPE_SYSTEM ? "system" : "session");
-  log_info("Target: %s on %s bus", config.proxy_bus_name,
-           config.target_bus_type == G_BUS_TYPE_SYSTEM ? "system" : "session");
+log_info("Starting cross-bus D-Bus proxy");
+log_info("Source: %s%s on %s bus", config.source_bus_name,
+         config.source_object_path,
+         config.source_bus_type == G_BUS_TYPE_SYSTEM ? "system" : "session");
+log_info("Target: %s on %s bus", config.proxy_bus_name,
+         config.target_bus_type == G_BUS_TYPE_SYSTEM ? "system" : "session");
 
-  // Initialize proxy state
-  if (!init_proxy_state(&config)) {
-    log_error("Failed to initialize proxy state");
-    return 1;
-  }
+// Initialize proxy state
+if (!init_proxy_state(&config)) {
+  log_error("Failed to initialize proxy state");
+  return 1;
+}
 
-  // Connect to both buses
-  if (!connect_to_buses()) {
-    cleanup_proxy_state();
-    return 1;
-  }
+// Connect to both buses
+if (!connect_to_buses()) {
+  cleanup_proxy_state();
+  return 1;
+}
 
-  // Fetch introspection data from source
-  if (!fetch_introspection_data()) {
-    cleanup_proxy_state();
-    return 1;
-  }
+// Fetch introspection data from source
+if (!fetch_introspection_data()) {
+  cleanup_proxy_state();
+  return 1;
+}
 
-  // Start owning the proxy name on the target bus
-  proxy_state->name_owner_watch_id = g_bus_own_name(
-      proxy_state->config.target_bus_type, proxy_state->config.proxy_bus_name,
-      G_BUS_NAME_OWNER_FLAGS_NONE, on_bus_acquired_for_owner,
-      on_name_acquired_log, on_name_lost_log, NULL, NULL);
+// Start owning the proxy name on the target bus
+proxy_state->name_owner_watch_id = g_bus_own_name(
+    proxy_state->config.target_bus_type, proxy_state->config.proxy_bus_name,
+    G_BUS_NAME_OWNER_FLAGS_NONE, on_bus_acquired_for_owner,
+    on_name_acquired_log, on_name_lost_log, NULL, NULL);
 
-  // Run main loop
-  GMainLoop *loop = g_main_loop_new(NULL, FALSE);
-  g_main_loop_run(loop);
+if (proxy_state->name_owner_watch_id == 0) {
+  log_error("Failed to own name %s on target bus",
+            proxy_state->config.proxy_bus_name);
+  cleanup_proxy_state();
+  return 1;
+}
 
-  // Cleanup
-  if (proxy_state && proxy_state->name_owner_watch_id) {
+// Watch for the source service to vanish
+proxy_state->source_service_watch_id = g_bus_watch_name(
+    proxy_state->config.source_bus_type, proxy_state->config.source_bus_name,
+    G_BUS_NAME_WATCHER_FLAGS_NONE,
+    NULL,                // on_name_appeared,
+    on_service_vanished, // on_name_vanished
+    NULL,                // user_data
+    NULL                 // flags
+);
+
+if (proxy_state->source_service_watch_id == 0) {
+  log_error("Failed to watch name %s on source bus",
+            proxy_state->config.source_bus_name);
+  if (proxy_state->name_owner_watch_id) {
     g_bus_unown_name(proxy_state->name_owner_watch_id);
     proxy_state->name_owner_watch_id = 0;
   }
-
-  g_main_loop_unref(loop);
   cleanup_proxy_state();
+  return 1;
+}
 
-  return 0;
+// Run main loop
+proxy_state->main_loop = g_main_loop_new(NULL, FALSE);
+g_main_loop_run(proxy_state->main_loop);
+
+// Cleanup
+if (proxy_state && proxy_state->name_owner_watch_id) {
+  g_bus_unown_name(proxy_state->name_owner_watch_id);
+  proxy_state->name_owner_watch_id = 0;
+}
+
+g_main_loop_unref(proxy_state->main_loop);
+cleanup_proxy_state();
+
+return 0;
 }
